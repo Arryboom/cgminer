@@ -64,14 +64,39 @@ enum {
 
 struct device_api bitforce_api;
 
-static void BFgets(char *buf, size_t bufLen, int fd)
+static void BFgets(char *buf, size_t bufLen, int fd, struct cgpu_info *bitforce)
 {
+	struct timeval start;
+	struct timeval end;
+	struct timeval elapsed;
+	struct cgminer_pool_stats *dev_stats = &bitforce->device_times;
+
+	gettimeofday(&start, NULL);
+
 	do {
 		buf[0] = '\0';
 		--bufLen;
 	} while (likely(bufLen && read(fd, buf, 1) == 1 && (buf++)[0] != '\n'));
 
 	buf[0] = '\0';
+	if (bitforce)
+	{
+		gettimeofday(&end, NULL);
+		timersub(&end, &start, &elapsed);
+
+		timeradd(&elapsed, &(dev_stats->getwork_wait), &(dev_stats->getwork_wait));
+		if (timercmp(&elapsed, &(dev_stats->getwork_wait_max), >)) {
+			dev_stats->getwork_wait_max.tv_sec = elapsed.tv_sec;
+			dev_stats->getwork_wait_max.tv_usec = elapsed.tv_usec;
+		}
+		if (timercmp(&elapsed, &(dev_stats->getwork_wait_min), <)) {
+			dev_stats->getwork_wait_min.tv_sec = elapsed.tv_sec;
+			dev_stats->getwork_wait_min.tv_usec = elapsed.tv_usec;
+		}
+		dev_stats->getwork_calls++;
+
+		dev_stats->getwork_wait_rolling = ((double)dev_stats->getwork_wait.tv_sec + ((double)dev_stats->getwork_wait.tv_usec / 1000000)) / dev_stats->getwork_calls;
+	}
 }
 
 static ssize_t BFwrite(int fd, const void *buf, ssize_t bufLen)
@@ -100,7 +125,8 @@ static bool bitforce_detect_one(const char *devpath)
 
 	BFwrite(fdDev, "ZGX", 3);
 	pdevbuf[0] = '\0';
-	BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+	BFgets(pdevbuf, sizeof(pdevbuf), fdDev, NULL);
+
 	if (unlikely(!pdevbuf[0])) {
 		applog(LOG_ERR, "BFL: Error reading/timeout (ZGX)");
 		return 0;
@@ -108,7 +134,7 @@ static bool bitforce_detect_one(const char *devpath)
 
 	BFclose(fdDev);
 	if (unlikely(!strstr(pdevbuf, "SHA256"))) {
-		applog(LOG_ERR, "BFL: Didn't recognise BitForce on %s", devpath);
+		applog(LOG_ERR, "BFL: Didn't recognize BitForce on %s", devpath);
 		return false;
 	}
 
@@ -118,6 +144,8 @@ static bool bitforce_detect_one(const char *devpath)
 	bitforce->device_path = strdup(devpath);
 	bitforce->deven = DEV_ENABLED;
 	bitforce->threads = 1;
+	bitforce->device_times.getwork_wait_min.tv_sec = MIN_SEC_UNSET;
+
 	/* Initially enable support for nonce range and disable it later if it
 	 * fails */
 	if (opt_bfl_noncerange) {
@@ -278,7 +306,7 @@ static void bitforce_clear_buffer(struct cgpu_info *bitforce)
 	mutex_lock(&bitforce->device_mutex);
 	do {
 		pdevbuf[0] = '\0';
-		BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+		BFgets(pdevbuf, sizeof(pdevbuf), fdDev, bitforce);
 	} while (pdevbuf[0] && (++count < 10));
 	mutex_unlock(&bitforce->device_mutex);
 }
@@ -311,7 +339,7 @@ void bitforce_init(struct cgpu_info *bitforce)
 	do {
 		BFwrite(fdDev, "ZGX", 3);
 		pdevbuf[0] = '\0';
-		BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+		BFgets(pdevbuf, sizeof(pdevbuf), fdDev, bitforce);
 
 		if (unlikely(!pdevbuf[0])) {
 			mutex_unlock(&bitforce->device_mutex);
@@ -398,9 +426,9 @@ static bool bitforce_get_temp(struct cgpu_info *bitforce)
 
 	BFwrite(fdDev, "ZLX", 3);
 	pdevbuf[0] = '\0';
-	BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+	BFgets(pdevbuf, sizeof(pdevbuf), fdDev, bitforce);
 	mutex_unlock(&bitforce->device_mutex);
-	
+
 	if (unlikely(!pdevbuf[0])) {
 		applog(LOG_ERR, "BFL%i: Error: Get temp returned empty string/timed out", bitforce->device_id);
 		bitforce->hw_errors++;
@@ -460,7 +488,7 @@ re_send:
 	else
 		BFwrite(fdDev, "ZDX", 3);
 	pdevbuf[0] = '\0';
-	BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+	BFgets(pdevbuf, sizeof(pdevbuf), fdDev, bitforce);
 	if (!pdevbuf[0] || !strncasecmp(pdevbuf, "B", 1)) {
 		mutex_unlock(&bitforce->device_mutex);
 		nmsleep(WORK_CHECK_INTERVAL_MS);
@@ -500,7 +528,7 @@ re_send:
 	}
 
 	pdevbuf[0] = '\0';
-	BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+	BFgets(pdevbuf, sizeof(pdevbuf), fdDev, bitforce);
 	mutex_unlock(&bitforce->device_mutex);
 
 	if (opt_debug) {
@@ -544,15 +572,18 @@ static int64_t bitforce_get_result(struct thr_info *thr, struct work *work)
 		mutex_lock(&bitforce->device_mutex);
 		BFwrite(fdDev, "ZFX", 3);
 		pdevbuf[0] = '\0';
-		BFgets(pdevbuf, sizeof(pdevbuf), fdDev);
+		BFgets(pdevbuf, sizeof(pdevbuf), fdDev, bitforce);
 		mutex_unlock(&bitforce->device_mutex);
 
 		gettimeofday(&now, NULL);
 		timersub(&now, &bitforce->work_start_tv, &elapsed);
 
 		if (elapsed.tv_sec >= BITFORCE_LONG_TIMEOUT_S) {
-			applog(LOG_ERR, "BFL%i: took %dms - longer than %dms", bitforce->device_id,
-				tv_to_ms(elapsed), BITFORCE_LONG_TIMEOUT_MS);
+			applog(LOG_ERR, "BFL%i: took %dms - longer than %dms. Temp: %f", bitforce->device_id,
+				tv_to_ms(elapsed), BITFORCE_LONG_TIMEOUT_MS, bitforce->temp);
+			bitforce->device_last_not_well = time(NULL);
+			bitforce->device_not_well_reason = REASON_DEV_COMMS_ERROR;
+			bitforce->dev_comms_error_count++;
 			return 0;
 		}
 
@@ -566,11 +597,16 @@ static int64_t bitforce_get_result(struct thr_info *thr, struct work *work)
 	}
 
 	if (elapsed.tv_sec > BITFORCE_TIMEOUT_S) {
-		applog(LOG_ERR, "BFL%i: took %dms - longer than %dms", bitforce->device_id,
-			tv_to_ms(elapsed), BITFORCE_TIMEOUT_MS);
+		applog(LOG_ERR, "BFL%i: took %dms - longer than %dms. Temp: %f", bitforce->device_id,
+			tv_to_ms(elapsed), BITFORCE_TIMEOUT_MS, bitforce->temp);
 		bitforce->device_last_not_well = time(NULL);
 		bitforce->device_not_well_reason = REASON_DEV_OVER_HEAT;
 		bitforce->dev_over_heat_count++;
+
+		if (!bitforce->throttle_temp)
+			bitforce->throttle_temp = bitforce->temp;
+		else
+			bitforce->throttle_temp = bitforce->throttle_temp + (bitforce->temp - bitforce->throttle_temp)/4;
 
 		if (!pdevbuf[0])	/* Only return if we got nothing after timeout - there still may be results */
 			return 0;
@@ -672,7 +708,7 @@ static int64_t bitforce_scanhash(struct thr_info *thr, struct work *work, int64_
 
 	if (ret == -1) {
 		ret = 0;
-		applog(LOG_ERR, "BFL%i: Comms error", bitforce->device_id);
+		applog(LOG_ERR, "BFL%i: Comms error. Temp: %f", bitforce->device_id, bitforce->temp);
 		bitforce->device_last_not_well = time(NULL);
 		bitforce->device_not_well_reason = REASON_DEV_COMMS_ERROR;
 		bitforce->dev_comms_error_count++;
@@ -717,6 +753,11 @@ static struct api_data *bitforce_api_stats(struct cgpu_info *cgpu)
 	// If locking becomes an issue for any of them, use copy_data=true also
 	root = api_add_uint(root, "Sleep Time", &(cgpu->sleep_ms), false);
 	root = api_add_uint(root, "Avg Wait", &(cgpu->avg_wait_d), false);
+
+	root = api_add_timeval(root, "Dev Max", &(cgpu->device_times.getwork_wait_max), false);
+	root = api_add_timeval(root, "Dev Min", &(cgpu->device_times.getwork_wait_min), false);
+	root = api_add_double(root, "Dev Av", &(cgpu->device_times.getwork_wait_rolling), false);
+	root = api_add_double(root, "Throttle", &(cgpu->throttle_temp), false);
 
 	return root;
 }
