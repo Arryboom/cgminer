@@ -196,8 +196,9 @@ unsigned int total_go, total_ro;
 
 struct pool **pools;
 static struct pool *currentpool = NULL;
-
+bool opt_pool_disable = false;
 int total_pools, enabled_pools;
+enum pool_enable opt_pool_enabled = POOL_ENABLED;
 enum pool_strategy pool_strategy = POOL_FAILOVER;
 int opt_rotate_period;
 static int total_urls, total_users, total_passes, total_userpasses;
@@ -419,6 +420,8 @@ static struct pool *add_pool(void)
 	/* Make sure the pool doesn't think we've been idle since time 0 */
 	pool->tv_idle.tv_sec = ~0UL;
 
+	pool->enabled = POOL_ENABLED;
+
 	return pool;
 }
 
@@ -608,6 +611,20 @@ static char *set_userpass(const char *arg)
 	pool = pools[total_userpasses - 1];
 	opt_set_charp(arg, &pool->rpc_userpass);
 
+	return NULL;
+}
+
+static char *set_pool_disabled(bool *pool_disable)
+{
+	struct pool *pool;
+
+	if(!*pool_disable)
+		return NULL;
+
+	if (total_pools) {
+		pool = pools[total_pools - 1];
+		pool->enabled = POOL_DISABLED;
+    }
 	return NULL;
 }
 
@@ -1058,6 +1075,9 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--userpass|-O",
 		     set_userpass, NULL, NULL,
 		     "Username:Password pair for bitcoin JSON-RPC server"),
+	OPT_WITHOUT_ARG("--disable-pool",
+			set_pool_disabled, &opt_pool_disable,
+			"Start with pool disabled."),
 	OPT_WITH_ARG("--pools",
 			opt_set_bool, NULL, NULL, opt_hidden),
 	OPT_ENDTABLE
@@ -3084,15 +3104,25 @@ static char *json_escape(char *str)
 
 void write_config(FILE *fcfg)
 {
-	int i;
+	int i = 0;
+	int j = 0;
+	char *s;
 
-	/* Write pool values */
+	/* Write pool values in priority order */
 	fputs("{\n\"pools\" : [", fcfg);
-	for(i = 0; i < total_pools; i++) {
-		fprintf(fcfg, "%s\n\t{\n\t\t\"url\" : \"%s\",", i > 0 ? "," : "", json_escape(pools[i]->rpc_url));
-		fprintf(fcfg, "\n\t\t\"user\" : \"%s\",", json_escape(pools[i]->rpc_user));
-		fprintf(fcfg, "\n\t\t\"pass\" : \"%s\"\n\t}", json_escape(pools[i]->rpc_pass));
-		}
+	while((j < total_pools) && (i < total_pools)) {
+		if(pools[i]->prio == j) {
+			fprintf(fcfg, "\n\t{\n\t\t\"url\" : \"%s\",", pools[i]->rpc_url);
+			fprintf(fcfg, "\n\t\t\"user\" : \"%s\",", pools[i]->rpc_user);
+			fprintf(fcfg, "\n\t\t\"pass\" : \"%s\"", pools[i]->rpc_pass);
+			s = (pools[i]->enabled == POOL_DISABLED) ? ",\n\t\t\"disable-pool\" : true\n\t}%s" : "\n\t}%s";
+			fprintf(fcfg, s, (j < total_pools - 1) ? "," : "");
+			j++;
+			i=0;
+		} else
+			i++;
+	}
+
 	fputs("\n]\n", fcfg);
 
 #ifdef HAVE_OPENCL
@@ -5521,8 +5551,14 @@ int main(int argc, char *argv[])
 				quit(1, "Failed to find colon delimiter in userpass");
 		}
 	}
-	/* Set the currentpool to pool 0 */
-	currentpool = pools[0];
+	/* Set the currentpool to pool first enabled */
+	for (i = 0; i < total_pools; i++) {
+	  currentpool = pools[i];
+	  if (currentpool->enabled == POOL_ENABLED)
+		break;
+	}
+	if (i == total_pools)
+		quit(1, "All pools disabled!");
 
 #ifdef HAVE_SYSLOG_H
 	if (use_syslog)
