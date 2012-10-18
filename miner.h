@@ -178,6 +178,11 @@ static inline int fsync (int fd)
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 #endif
 
+#define roundl(x) (unsigned long long) ((x) + 0.5)
+#define round(x) (int) ((x) + ((x)>0?+0.5:-0.5))
+#define floor(x) (int) ((x) + ((x)>0?+0.0:-0.5))
+#define roundf(x) (double) round(x)
+
 enum alive {
 	LIFE_WELL,
 	LIFE_SICK,
