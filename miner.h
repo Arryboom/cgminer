@@ -805,8 +805,8 @@ struct stratum_work {
 	int diff;
 };
 
-#define RECVSIZE 8191
-#define RBUFSIZE (RECVSIZE + 1)
+#define RECVSIZE 8192
+#define RBUFSIZE (RECVSIZE + 4)
 
 struct pool {
 	int pool_no;
@@ -877,7 +877,6 @@ struct pool {
 	CURL *stratum_curl;
 	SOCKETTYPE sock;
 	char sockbuf[RBUFSIZE];
-	struct sockaddr_in *server, client;
 	char *sockaddr_url; /* stripped url used for sockaddr */
 	char *nonce1;
 	uint32_t nonce2;

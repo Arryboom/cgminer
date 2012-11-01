@@ -196,39 +196,41 @@ out:
 	return ptrlen;
 }
 
-int json_rpc_call_sockopt_cb(void __maybe_unused *userdata, curl_socket_t fd,
-			     curlsocktype __maybe_unused purpose)
+static int keep_sockalive(SOCKETTYPE fd)
 {
-	int tcp_keepidle = 120;
-	int tcp_keepintvl = 120;
+	const int tcp_keepidle = 60;
+	const int tcp_keepintvl = 60;
+	const int keepalive = 1;
+	int ret = 0;
+
 
 #ifndef WIN32
-	int keepalive = 1;
-	int tcp_keepcnt = 5;
+	const int tcp_keepcnt = 5;
 
 	if (unlikely(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive))))
-		return 1;
+		ret = 1;
 
 # ifdef __linux
 
 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &tcp_keepcnt, sizeof(tcp_keepcnt))))
-		return 1;
+		ret = 1;
 
 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &tcp_keepidle, sizeof(tcp_keepidle))))
-		return 1;
+		ret = 1;
 
 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &tcp_keepintvl, sizeof(tcp_keepintvl))))
-		return 1;
+		ret = 1;
 # endif /* __linux */
 # ifdef __APPLE_CC__
 
 	if (unlikely(setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &tcp_keepintvl, sizeof(tcp_keepintvl))))
-		return 1;
+		ret = 1;
 
 # endif /* __APPLE_CC__ */
 
 #else /* WIN32 */
 
+	const int zero = 0;
 	struct tcp_keepalive vals;
 	vals.onoff = 1;
 	vals.keepalivetime = tcp_keepidle * 1000;
@@ -236,12 +238,26 @@ int json_rpc_call_sockopt_cb(void __maybe_unused *userdata, curl_socket_t fd,
 
 	DWORD outputBytes;
 
-	if (unlikely(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), NULL, 0, &outputBytes, NULL, NULL)))
-		return 1;
+	if (unlikely(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&keepalive, sizeof(keepalive))))
+		ret = 1;
 
+	if (unlikely(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), NULL, 0, &outputBytes, NULL, NULL)))
+		ret = 1;
+
+	/* Windows happily submits indefinitely to the send buffer blissfully
+	 * unaware nothing is getting there without gracefully failing unless
+	 * we disable the send buffer */
+	if (unlikely(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&zero, sizeof(zero))))
+		ret = 1;
 #endif /* WIN32 */
 
-	return 0;
+	return ret;
+}
+
+int json_rpc_call_sockopt_cb(void __maybe_unused *userdata, curl_socket_t fd,
+			     curlsocktype __maybe_unused purpose)
+{
+	return keep_sockalive(fd);
 }
 
 static void last_nettime(struct timeval *last)
@@ -820,9 +836,9 @@ bool extract_sockaddr(struct pool *pool, char *url)
 {
 	char *url_begin, *url_end, *port_start = NULL;
 	char url_address[256], port[6];
-	struct addrinfo hints, *res;
 	int url_len, port_len = 0;
 
+	pool->sockaddr_url = url;
 	url_begin = strstr(url, "//");
 	if (!url_begin)
 		url_begin = url;
@@ -849,24 +865,13 @@ bool extract_sockaddr(struct pool *pool, char *url)
 		strcpy(port, "80");
 
 	pool->stratum_port = strdup(port);
-
-	memset(&hints, 0, sizeof(struct addrinfo));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-
-	if (getaddrinfo(url_address, port, &hints, &res)) {
-		applog(LOG_DEBUG, "Failed to extract sock addr");
-		return false;
-	}
-
-	pool->server = (struct sockaddr_in *)res->ai_addr;
 	pool->sockaddr_url = strdup(url_address);
 
 	return true;
 }
 
-/* Send a single command across a socket, appending \n to it */
+/* Send a single command across a socket, appending \n to it. This should all
+ * be done under stratum lock except when first establishing the socket */
 static bool __stratum_send(struct pool *pool, char *s, ssize_t len)
 {
 	SOCKETTYPE sock = pool->sock;
@@ -881,6 +886,7 @@ static bool __stratum_send(struct pool *pool, char *s, ssize_t len)
 	while (len > 0 ) {
 		struct timeval timeout = {0, 0};
 		size_t sent = 0;
+		CURLcode rc;
 		fd_set wd;
 
 		FD_ZERO(&wd);
@@ -889,7 +895,8 @@ static bool __stratum_send(struct pool *pool, char *s, ssize_t len)
 			applog(LOG_DEBUG, "Write select failed on pool %d sock", pool->pool_no);
 			return false;
 		}
-		if (curl_easy_send(pool->stratum_curl, s + ssent, len, &sent) != CURLE_OK) {
+		rc = curl_easy_send(pool->stratum_curl, s + ssent, len, &sent);
+		if (rc != CURLE_OK) {
 			applog(LOG_DEBUG, "Failed to curl_easy_send in stratum_send");
 			return false;
 		}
@@ -914,14 +921,15 @@ bool stratum_send(struct pool *pool, char *s, ssize_t len)
 	return ret;
 }
 
-#define RECVSIZE 8191
-#define RBUFSIZE (RECVSIZE + 1)
-
 static void clear_sock(struct pool *pool)
 {
-	SOCKETTYPE sock = pool->sock;
+	size_t n = 0;
 
-	recv(sock, pool->sockbuf, RECVSIZE, MSG_DONTWAIT);
+	mutex_lock(&pool->stratum_lock);
+	/* Ignore return code of curl_easy_recv since we're just clearing
+	 * anything in the socket if it's still alive */
+	curl_easy_recv(pool->stratum_curl, pool->sockbuf, RECVSIZE, &n);
+	mutex_unlock(&pool->stratum_lock);
 	strcpy(pool->sockbuf, "");
 }
 
@@ -953,7 +961,7 @@ char *recv_line(struct pool *pool)
 {
 	ssize_t len, buflen;
 	char *tok, *sret = NULL;
-	size_t n;
+	size_t n = 0;
 
 	if (!strstr(pool->sockbuf, "\n")) {
 		char s[RBUFSIZE];
@@ -1076,6 +1084,13 @@ static bool parse_notify(struct pool *pool, json_t *val)
 	}
 
 	mutex_lock(&pool->pool_lock);
+	free(pool->swork.job_id);
+	free(pool->swork.prev_hash);
+	free(pool->swork.coinbase1);
+	free(pool->swork.coinbase2);
+	free(pool->swork.bbversion);
+	free(pool->swork.nbit);
+	free(pool->swork.ntime);
 	pool->swork.job_id = job_id;
 	pool->swork.prev_hash = prev_hash;
 	pool->swork.coinbase1 = coinbase1;
@@ -1307,7 +1322,6 @@ bool initiate_stratum(struct pool *pool)
 
 	mutex_lock(&pool->stratum_lock);
 	pool->stratum_active = false;
-
 	if (!pool->stratum_curl) {
 		pool->stratum_curl = curl_easy_init();
 		if (unlikely(!pool->stratum_curl))
@@ -1320,7 +1334,8 @@ bool initiate_stratum(struct pool *pool)
 	memset(s, 0, RBUFSIZE);
 	sprintf(s, "http://%s:%s", pool->sockaddr_url, pool->stratum_port);
 
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 60);
+	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err_str);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_URL, s);
@@ -1339,6 +1354,7 @@ bool initiate_stratum(struct pool *pool)
 		goto out;
 	}
 	curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, (long *)&pool->sock);
+	keep_sockalive(pool->sock);
 
 	sprintf(s, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": []}", swork_id++);
 
@@ -1407,15 +1423,8 @@ out:
 			applog(LOG_DEBUG, "Pool %d confirmed mining.subscribe with extranonce1 %s extran2size %d",
 			       pool->pool_no, pool->nonce1, pool->n2size);
 		}
-	} else {
-		applog(LOG_DEBUG, "Initiate stratum failed, disabling stratum_active");
-		mutex_lock(&pool->stratum_lock);
-		if (curl) {
-			curl_easy_cleanup(curl);
-			pool->stratum_curl = NULL;
-		}
-		mutex_unlock(&pool->stratum_lock);
-	}
+	} else
+		applog(LOG_DEBUG, "Initiate stratum failed");
 
 	return ret;
 }

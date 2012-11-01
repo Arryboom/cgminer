@@ -92,6 +92,7 @@ bool use_syslog;
 bool opt_quiet;
 bool opt_realquiet;
 bool opt_loginput;
+bool opt_compact;
 const int opt_cutofftemp = 95;
 int opt_log_interval = 5;
 int opt_queue = 1;
@@ -213,15 +214,17 @@ const
 #endif
 bool curses_active;
 
-static char current_block[37];
+static char current_block[40];
 static char *current_hash;
 char *current_fullhash;
 static char datestamp[40];
 static char blocktime[30];
 struct timeval block_timeval;
+static char best_share[8] = "0";
+static uint64_t best_diff = 0;
 
 struct block {
-	char hash[37];
+	char hash[40];
 	UT_hash_handle hh;
 	int block_no;
 };
@@ -261,7 +264,7 @@ static int include_count;
 
 bool ping = true;
 
-struct sigaction termhandler, inthandler;
+struct sigaction termhandler, inthandler, segvhandler, bushandler, illhandler;
 
 struct thread_q *getq;
 
@@ -549,10 +552,10 @@ static char *set_rr(enum pool_strategy *strategy)
  * stratum+tcp or by detecting a stratum server response */
 bool detect_stratum(struct pool *pool, char *url)
 {
-	if (opt_scrypt)
+	if (!extract_sockaddr(pool, url))
 		return false;
 
-	if (!extract_sockaddr(pool, url))
+	if (opt_scrypt)
 		return false;
 
 	if (!strncasecmp(url, "stratum+tcp://", 14)) {
@@ -852,6 +855,13 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--bench-algo|-b",
 		     set_int_0_to_9999, opt_show_intval, &opt_bench_algo,
 		     opt_hidden),
+#endif
+#ifdef HAVE_CURSES
+	OPT_WITHOUT_ARG("--compact",
+			opt_set_bool, &opt_compact,
+			"Use compact display without per device statistics"),
+#endif
+#ifdef WANT_CPUMINE
 	OPT_WITH_ARG("--cpu-threads|-t",
 		     force_nthreads_int, opt_show_intval, &opt_n_threads,
 		     "Number of miner CPU threads"),
@@ -975,7 +985,7 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--no-restart",
 			opt_set_invbool, &opt_restart,
 #ifdef HAVE_OPENCL
-			"Do not attempt to restart GPUs that hang"
+			"Do not attempt to restart GPUs that hang or cgminer if it crashes"
 #else
 			opt_hidden
 #endif
@@ -1578,16 +1588,16 @@ static void curses_print_status(void)
 	wclrtoeol(statuswin);
 	if (pool->has_stratum) {
 		mvwprintw(statuswin, 4, 0, " Connected to %s with stratum as user %s",
-			pool->stratum_url, pool->rpc_user);
+			pool->sockaddr_url, pool->rpc_user);
 	} else if ((pool_strategy == POOL_LOADBALANCE  || pool_strategy == POOL_BALANCE) && total_pools > 1) {
 		mvwprintw(statuswin, 4, 0, " Connected to multiple pools with%s LP",
 			have_longpoll ? "": "out");
 	} else {
 		mvwprintw(statuswin, 4, 0, " Connected to %s with%s LP as user %s",
-			pool->rpc_url, have_longpoll ? "": "out", pool->rpc_user);
+			pool->sockaddr_url, have_longpoll ? "": "out", pool->rpc_user);
 	}
 	wclrtoeol(statuswin);
-	mvwprintw(statuswin, 5, 0, " Block: %s...  Started: %s", current_hash, blocktime);
+	mvwprintw(statuswin, 5, 0, " Block: %s...  Started: %s  Best share: %s   ", current_hash, blocktime, best_share);
 	mvwhline(statuswin, 6, 0, '-', 80);
 	mvwhline(statuswin, statusy - 1, 0, '-', 80);
 	mvwprintw(statuswin, devcursor - 1, 1, "[P]ool management %s[S]ettings [D]isplay options [Q]uit",
@@ -1610,7 +1620,7 @@ static void curses_print_devstatus(int thr_id)
 	char displayed_hashes[16], displayed_rolling[16];
 	uint64_t dh64, dr64;
 
-	if (devcursor + cgpu->cgminer_id > LINES - 2)
+	if (devcursor + cgpu->cgminer_id > LINES - 2 || opt_compact)
 		return;
 
 	cgpu->utility = cgpu->accepted / total_secs * 60;
@@ -1670,14 +1680,13 @@ static void print_status(int thr_id)
 
 #ifdef HAVE_CURSES
 /* Check for window resize. Called with curses mutex locked */
-static inline bool change_logwinsize(void)
+static inline void change_logwinsize(void)
 {
 	int x, y, logx, logy;
-	bool ret = false;
 
 	getmaxyx(mainwin, y, x);
 	if (x < 80 || y < 25)
-		return ret;
+		return;
 
 	if (y > statusy + 2 && statusy < logstart) {
 		if (y - 2 < logstart)
@@ -1687,17 +1696,13 @@ static inline bool change_logwinsize(void)
 		logcursor = statusy + 1;
 		mvwin(logwin, logcursor, 0);
 		wresize(statuswin, statusy, x);
-		ret = true;
 	}
 
 	y -= logcursor;
 	getmaxyx(logwin, logy, logx);
 	/* Detect screen size change */
-	if (x != logx || y != logy) {
+	if (x != logx || y != logy)
 		wresize(logwin, y, x);
-		ret = true;
-	}
-	return ret;
 }
 
 static void check_winsizes(void)
@@ -1707,6 +1712,7 @@ static void check_winsizes(void)
 	if (curses_active_locked()) {
 		int y, x;
 
+		erase();
 		x = getmaxx(statuswin);
 		if (logstart > LINES - 2)
 			statusy = LINES - 2;
@@ -1720,6 +1726,18 @@ static void check_winsizes(void)
 		mvwin(logwin, logcursor, 0);
 		unlock_curses();
 	}
+}
+
+static void switch_compact(void)
+{
+	if (opt_compact) {
+		logstart = devcursor + 1;
+		logcursor = logstart + 1;
+	} else {
+		logstart = devcursor + total_devices + 1;
+		logcursor = logstart + 1;
+	}
+	check_winsizes();
 }
 
 /* For mandatory printing when mutex is already locked */
@@ -1770,6 +1788,7 @@ bool log_curses_only(int prio, const char *f, va_list ap)
 void clear_logwin(void)
 {
 	if (curses_active_locked()) {
+		erase();
 		wclear(logwin);
 		unlock_curses();
 	}
@@ -1980,17 +1999,26 @@ static uint64_t share_diff(const struct work *work)
 	if (unlikely(!d64))
 		d64 = 1;
 	ret = diffone / d64;
+	if (ret > best_diff) {
+		best_diff = ret;
+		suffix_string(best_diff, best_share, 0);
+	}
 	return ret;
 }
 
 static uint32_t scrypt_diff(const struct work *work)
 {
 	const uint32_t scrypt_diffone = 0x0000fffful;
-	uint32_t d32 = work->outputhash;
+	uint32_t d32 = work->outputhash, ret;
 
 	if (unlikely(!d32))
 		d32 = 1;
-	return scrypt_diffone / d32;
+	ret = scrypt_diffone / d32;
+	if (ret > best_diff) {
+		best_diff = ret;
+		suffix_string(best_diff, best_share, 0);
+	}
+	return ret;
 }
 
 static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
@@ -2438,13 +2466,8 @@ char **initial_args;
 
 static void clean_up(void);
 
-void app_restart(void)
+static inline void __app_restart(void)
 {
-	applog(LOG_WARNING, "Attempting to restart %s", packagename);
-
-	__kill_work();
-	clean_up();
-
 #if defined(unix)
 	if (forkpid > 0) {
 		kill(forkpid, SIGTERM);
@@ -2453,15 +2476,53 @@ void app_restart(void)
 #endif
 
 	execv(initial_args[0], initial_args);
+}
+
+void app_restart(void)
+{
+	applog(LOG_WARNING, "Attempting to restart %s", packagename);
+
+	__kill_work();
+	clean_up();
+
+	__app_restart();
+
+	/* We shouldn't reach here */
 	applog(LOG_WARNING, "Failed to restart application");
 }
 
-static void sighandler(int __maybe_unused sig)
+/* Returns all signal handlers to their defaults */
+static inline void __sighandler(void)
 {
 	/* Restore signal handlers so we can still quit if kill_work fails */
 	sigaction(SIGTERM, &termhandler, NULL);
 	sigaction(SIGINT, &inthandler, NULL);
+	if (opt_restart) {
+		sigaction(SIGSEGV, &segvhandler, NULL);
+		sigaction(SIGILL, &illhandler, NULL);
+#ifndef WIN32
+		sigaction(SIGBUS, &bushandler, NULL);
+#endif
+	}
+}
+
+static void sighandler(int __maybe_unused sig)
+{
+	__sighandler();
 	kill_work();
+}
+
+/* Handles segfaults and other crashes by attempting to restart cgminer. Try to
+ * do as little as possible since we are probably corrupted. */
+static void seghandler(int sig)
+{
+	__sighandler();
+	fprintf(stderr, "\nCrashed with signal %d! Will attempt to restart\n", sig);
+	__app_restart();
+	/* We shouldn't reach here */
+	fprintf(stderr, "Failed to restart, exiting now\n");
+
+	exit(1);
 }
 
 /* Called with pool_lock held. Recruit an extra curl if none are available for
@@ -2681,11 +2742,13 @@ retry:
 		while (!pool->stratum_active) {
 			struct pool *altpool = select_pool(true);
 
+			sleep(5);
 			if (altpool != pool) {
 				wc->pool = altpool;
+				inc_queued(altpool);
+				dec_queued(pool);
 				goto retry;
 			}
-			sleep(5);
 		}
 		ret_work = make_work();
 		gen_stratum_work(pool, ret_work);
@@ -2717,7 +2780,8 @@ retry:
 
 		/* obtain new work from bitcoin via JSON-RPC */
 		if (!get_upstream_work(ret_work, ce->curl)) {
-			applog(LOG_DEBUG, "json_rpc_call failed on get work, retrying");
+			applog(LOG_DEBUG, "Pool %d json_rpc_call failed on get work, retrying in 5s", pool->pool_no);
+			sleep(5);
 			dec_queued(pool);
 			/* Make sure the pool just hasn't stopped serving
 			 * requests but is up as we'll keep hammering it */
@@ -2857,16 +2921,14 @@ static void *submit_work_thread(void *userdata)
 		char s[1024];
 
 		memcpy(&sshare->work, work, sizeof(struct work));
-
-		/* Give the stratum share a unique id */
 		mutex_lock(&sshare_lock);
+		/* Give the stratum share a unique id */
 		sshare->id = swork_id++;
 		HASH_ADD_INT(stratum_shares, id, sshare);
 		mutex_unlock(&sshare_lock);
 
 		nonce = *((uint32_t *)(work->data + 76));
 		noncehex = bin2hex((const unsigned char *)&nonce, 4);
-
 		memset(s, 0, 1024);
 		sprintf(s, "{\"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\": %d, \"method\": \"mining.submit\"}",
 			pool->rpc_user, work->job_id, work->nonce2, work->ntime, noncehex, sshare->id);
@@ -2874,11 +2936,22 @@ static void *submit_work_thread(void *userdata)
 
 		applog(LOG_INFO, "Submitting share %08lx to pool %d", (unsigned long)(hash32[6]), pool->pool_no);
 
-		if (unlikely(!stratum_send(pool, s, strlen(s)))) {
+		if (likely(stratum_send(pool, s, strlen(s)))) {
+			if (pool_tclear(pool, &pool->submit_fail))
+					applog(LOG_WARNING, "Pool %d communication resumed, submitting work", pool->pool_no);
+			applog(LOG_DEBUG, "Successfully submitted, adding to stratum_shares db");
+		} else {
+			applog(LOG_INFO, "Failed to submit stratum share");
 			mutex_lock(&sshare_lock);
 			HASH_DEL(stratum_shares, sshare);
 			mutex_unlock(&sshare_lock);
 			free(sshare);
+
+			if (!pool_tset(pool, &pool->submit_fail)) {
+				total_ro++;
+				pool->remotefail_occasions++;
+				applog(LOG_WARNING, "Pool %d share submission failure", pool->pool_no);
+			}
 		}
 
 		goto out;
@@ -3107,14 +3180,14 @@ static void set_curblock(char *hexstr, unsigned char *hash)
 
 	strcpy(current_block, hexstr);
 	swap256(hash_swap, hash);
-	swap256(block_hash_swap, hash+4);
+	swap256(block_hash_swap, hash + 4);
 
 	/* Don't free current_hash directly to avoid dereferencing when read
 	 * elsewhere - and update block_timeval inside the same lock */
 	mutex_lock(&ch_lock);
 	gettimeofday(&block_timeval, NULL);
 	old_hash = current_hash;
-	current_hash = bin2hex(hash_swap, 16);
+	current_hash = bin2hex(hash_swap + 2, 12);
 	free(old_hash);
 	old_hash = current_fullhash;
 	current_fullhash = bin2hex(block_hash_swap, 32);
@@ -3123,8 +3196,6 @@ static void set_curblock(char *hexstr, unsigned char *hash)
 
 	get_timestamp(blocktime, &block_timeval);
 
-	if (unlikely(!current_hash))
-		quit (1, "set_curblock OOM");
 	applog(LOG_INFO, "New block: %s...", current_hash);
 }
 
@@ -3759,13 +3830,16 @@ static void display_options(void)
 	clear_logwin();
 retry:
 	wlogprint("[N]ormal [C]lear [S]ilent mode (disable all output)\n");
-	wlogprint("[D]ebug:%s\n[P]er-device:%s\n[Q]uiet:%s\n[V]erbose:%s\n[R]PC debug:%s\n[W]orkTime details:%s\n[L]og interval:%d\n",
+	wlogprint("[D]ebug:%s\n[P]er-device:%s\n[Q]uiet:%s\n[V]erbose:%s\n"
+		  "[R]PC debug:%s\n[W]orkTime details:%s\nco[M]pact: %s\n"
+		  "[L]og interval:%d\n",
 		opt_debug ? "on" : "off",
 	        want_per_device_stats? "on" : "off",
 		opt_quiet ? "on" : "off",
 		opt_log_output ? "on" : "off",
 		opt_protocol ? "on" : "off",
 		opt_worktime ? "on" : "off",
+		opt_compact ? "on" : "off",
 		opt_log_interval);
 	wlogprint("Select an option or any other key to return\n");
 	input = getch();
@@ -3784,8 +3858,10 @@ retry:
 		opt_debug = false;
 		opt_quiet = false;
 		opt_protocol = false;
+		opt_compact = false;
 		want_per_device_stats = false;
 		wlogprint("Output mode reset to normal\n");
+		switch_compact();
 		goto retry;
 	} else if (!strncasecmp(&input, "d", 1)) {
 		opt_debug ^= true;
@@ -3793,6 +3869,11 @@ retry:
 		if (opt_debug)
 			opt_quiet = false;
 		wlogprint("Debug mode %s\n", opt_debug ? "enabled" : "disabled");
+		goto retry;
+	} else if (!strncasecmp(&input, "m", 1)) {
+		opt_compact ^= true;
+		wlogprint("Compact mode %s\n", opt_compact ? "enabled" : "disabled");
+		switch_compact();
 		goto retry;
 	} else if (!strncasecmp(&input, "p", 1)) {
 		want_per_device_stats ^= true;
@@ -4244,15 +4325,17 @@ static void *stratum_thread(void *userdata)
 
 		FD_ZERO(&rd);
 		FD_SET(pool->sock, &rd);
-		timeout.tv_sec = 120;
+		timeout.tv_sec = 90;
 		timeout.tv_usec = 0;
 
 		/* The protocol specifies that notify messages should be sent
-		 * every minute so if we fail to receive any for 2 minutes we
+		 * every minute so if we fail to receive any for 90 seconds we
 		 * assume the connection has been dropped and treat this pool
 		 * as dead */
-		select(pool->sock + 1, &rd, NULL, NULL, &timeout);
-		s = recv_line(pool);
+		if (unlikely(select(pool->sock + 1, &rd, NULL, NULL, &timeout) < 1))
+			s = NULL;
+		else
+			s = recv_line(pool);
 		if (!s) {
 			applog(LOG_INFO, "Stratum connection to pool %d interrupted", pool->pool_no);
 			pool->getfail_occasions++;
@@ -4278,6 +4361,7 @@ static void *stratum_thread(void *userdata)
 		free(s);
 		if (pool->swork.clean) {
 			struct work work;
+			memset(&work, 0, sizeof(work));
 
 			/* Generate a single work item to update the current
 			 * block database */
@@ -5612,6 +5696,7 @@ static void print_summary(void)
 
 	applog(LOG_WARNING, "Average hashrate: %.1f %shash/s", displayed_hashes, mhash_base? "Mega" : "Kilo");
 	applog(LOG_WARNING, "Solved blocks: %d", found_blocks);
+	applog(LOG_WARNING, "Best share difficulty: %s", best_share);
 	applog(LOG_WARNING, "Queued work requests: %d", total_getworks);
 	applog(LOG_WARNING, "Share submissions: %d", total_accepted + total_rejected);
 	applog(LOG_WARNING, "Accepted shares: %d", total_accepted);
@@ -6081,6 +6166,18 @@ int main(int argc, char *argv[])
 	if (!config_loaded)
 		load_default_config();
 
+	if (opt_restart) {
+		struct sigaction shandler;
+
+		shandler.sa_handler = &seghandler;
+		shandler.sa_flags = 0;
+		sigemptyset(&shandler.sa_mask);
+		sigaction(SIGSEGV, &shandler, &segvhandler);
+		sigaction(SIGILL, &shandler, &illhandler);
+#ifndef WIN32
+		sigaction(SIGBUS, &shandler, &bushandler);
+#endif
+	}
 	if (opt_benchmark) {
 		struct pool *pool;
 
@@ -6245,12 +6342,13 @@ int main(int argc, char *argv[])
 	for (i = 0; i < total_devices; ++i)
 		devices[i]->cgminer_stats.getwork_wait_min.tv_sec = MIN_SEC_UNSET;
 
-	logstart += total_devices;
-	logcursor = logstart + 1;
-
+	if (!opt_compact) {
+		logstart += total_devices;
+		logcursor = logstart + 1;
 #ifdef HAVE_CURSES
-	check_winsizes();
+		check_winsizes();
 #endif
+	}
 
 	if (!total_pools) {
 		applog(LOG_WARNING, "Need to specify at least one pool server.");
