@@ -541,7 +541,7 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 		strcat(binaryfilename, "g");
 	if (opt_scrypt) {
 #ifdef USE_SCRYPT
-		sprintf(numbuf, "lg%dtc%d", cgpu->lookup_gap, cgpu->thread_concurrency);
+		sprintf(numbuf, "lg%utc%u", cgpu->lookup_gap, (unsigned int)cgpu->thread_concurrency);
 		strcat(binaryfilename, numbuf);
 #endif
 	} else {
@@ -614,7 +614,7 @@ build:
 #ifdef USE_SCRYPT
 	if (opt_scrypt)
 		sprintf(CompilerOptions, "-D LOOKUP_GAP=%d -D CONCURRENT_THREADS=%d -D WORKSIZE=%d",
-			cgpu->lookup_gap, cgpu->thread_concurrency, (int)clState->wsize);
+			cgpu->lookup_gap, (unsigned int)cgpu->thread_concurrency, (int)clState->wsize);
 	else
 #endif
 	{
@@ -810,14 +810,19 @@ built:
 		/* Use the max alloc value which has been rounded to a power of
 		 * 2 greater >= required amount earlier */
 		if (bufsize > cgpu->max_alloc) {
-			applog(LOG_WARNING, "Maximum buffer memory device %d supports says %u, your scrypt settings come to %u",
-			       gpu, cgpu->max_alloc, bufsize);
+			applog(LOG_WARNING, "Maximum buffer memory device %d supports says %u", gpu, cgpu->max_alloc);
+			applog(LOG_WARNING, "Your scrypt settings come to %u", bufsize);
 		} else
 			bufsize = cgpu->max_alloc;
 		applog(LOG_DEBUG, "Creating scrypt buffer sized %d", bufsize);
 		clState->padbufsize = bufsize;
+
+		/* This buffer is weird and might work to some degree even if
+		 * the create buffer call has apparently failed, so check if we
+		 * get anything back before we call it a failure. */
+		clState->padbuffer8 = NULL;
 		clState->padbuffer8 = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, bufsize, NULL, &status);
-		if (status != CL_SUCCESS) {
+		if (status != CL_SUCCESS && !clState->padbuffer8) {
 			applog(LOG_ERR, "Error %d: clCreateBuffer (padbuffer8), decrease CT or increase LG", status);
 			return NULL;
 		}

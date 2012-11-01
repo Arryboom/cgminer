@@ -29,6 +29,8 @@
  *      nonce range is completely calculated.
  */
 
+#include "config.h"
+
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -49,8 +51,8 @@
 #endif
 
 #include "elist.h"
-#include "fpgautils.h"
 #include "miner.h"
+#include "fpgautils.h"
 
 // The serial I/O speed - Linux uses a define 'B115200' in bits/termios.h
 #define ICARUS_IO_SPEED 115200
@@ -223,6 +225,11 @@ static void rev(unsigned char *s, size_t l)
 #define icarus_open2(devpath, baud, purge)  serial_open(devpath, baud, ICARUS_READ_FAULT_DECISECONDS, purge)
 #define icarus_open(devpath, baud)  icarus_open2(devpath, baud, false)
 
+#define ICA_GETS_ERROR -1
+#define ICA_GETS_OK 0
+#define ICA_GETS_RESTART 1
+#define ICA_GETS_TIMEOUT 2
+
 static int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, struct thr_info *thr, int read_count)
 {
 	ssize_t ret = 0;
@@ -233,12 +240,14 @@ static int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, st
 	// Read reply 1 byte at a time to get earliest tv_finish
 	while (true) {
 		ret = read(fd, buf, 1);
+		if (ret < 0)
+			return ICA_GETS_ERROR;
 
 		if (first)
 			gettimeofday(tv_finish, NULL);
 
 		if (ret >= read_amount)
-			return 0;
+			return ICA_GETS_OK;
 
 		if (ret > 0) {
 			buf += ret;
@@ -254,16 +263,16 @@ static int icarus_gets(unsigned char *buf, int fd, struct timeval *tv_finish, st
 					"Icarus Read: No data in %.2f seconds",
 					(float)rc/(float)TIME_FACTOR);
 			}
-			return 1;
+			return ICA_GETS_TIMEOUT;
 		}
 
-		if (thr->work_restart) {
+		if (thr && thr->work_restart) {
 			if (opt_debug) {
 				applog(LOG_DEBUG,
 					"Icarus Read: Work restart at %.2f seconds",
 					(float)(rc)/(float)TIME_FACTOR);
 			}
-			return 1;
+			return ICA_GETS_RESTART;
 		}
 	}
 }
@@ -280,6 +289,13 @@ static int icarus_write(int fd, const void *buf, size_t bufLen)
 }
 
 #define icarus_close(fd) close(fd)
+
+static void do_icarus_close(struct thr_info *thr)
+{
+	struct cgpu_info *icarus = thr->cgpu;
+	icarus_close(icarus->device_fd);
+	icarus->device_fd = -1;
+}
 
 static const char *timing_mode_str(enum timing_mode timing_mode)
 {
@@ -533,36 +549,31 @@ static bool icarus_detect_one(const char *devpath)
 	gettimeofday(&tv_start, NULL);
 
 	memset(nonce_bin, 0, sizeof(nonce_bin));
-	struct thr_info dummy = {
-		.work_restart = false,
-	};
-	icarus_gets(nonce_bin, fd, &tv_finish, &dummy, 1);
+	icarus_gets(nonce_bin, fd, &tv_finish, NULL, 1);
 
 	icarus_close(fd);
 
 	nonce_hex = bin2hex(nonce_bin, sizeof(nonce_bin));
-	if (nonce_hex) {
-		if (strncmp(nonce_hex, golden_nonce, 8)) {
-			applog(LOG_ERR, 
-				"Icarus Detect: "
-				"Test failed at %s: get %s, should: %s",
-				devpath, nonce_hex, golden_nonce);
-			free(nonce_hex);
-			return false;
-		}
-		applog(LOG_DEBUG, 
+	if (strncmp(nonce_hex, golden_nonce, 8)) {
+		applog(LOG_ERR,
 			"Icarus Detect: "
-			"Test succeeded at %s: got %s",
-				devpath, nonce_hex);
+			"Test failed at %s: get %s, should: %s",
+			devpath, nonce_hex, golden_nonce);
 		free(nonce_hex);
-	} else
 		return false;
+	}
+	applog(LOG_DEBUG,
+		"Icarus Detect: "
+		"Test succeeded at %s: got %s",
+			devpath, nonce_hex);
+	free(nonce_hex);
 
 	/* We have a real Icarus! */
 	struct cgpu_info *icarus;
 	icarus = calloc(1, sizeof(struct cgpu_info));
 	icarus->api = &icarus_api;
 	icarus->device_path = strdup(devpath);
+	icarus->device_fd = -1;
 	icarus->threads = 1;
 	add_cgpu(icarus);
 	icarus_info = realloc(icarus_info, sizeof(struct ICARUS_INFO *) * (total_devices + 1));
@@ -598,7 +609,7 @@ static bool icarus_detect_one(const char *devpath)
 
 static void icarus_detect()
 {
-	serial_detect(icarus_api.dname, icarus_detect_one);
+	serial_detect(&icarus_api, icarus_detect_one);
 }
 
 static bool icarus_prepare(struct thr_info *thr)
@@ -606,6 +617,8 @@ static bool icarus_prepare(struct thr_info *thr)
 	struct cgpu_info *icarus = thr->cgpu;
 
 	struct timeval now;
+
+	icarus->device_fd = -1;
 
 	int fd = icarus_open(icarus->device_path, icarus_info[icarus->device_id]->baud);
 	if (unlikely(-1 == fd)) {
@@ -639,7 +652,8 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 	struct timeval tv_start, tv_finish, elapsed;
 	struct timeval tv_history_start, tv_history_finish;
 	double Ti, Xi;
-	int i;
+	int curr_hw_errors, i;
+	bool was_hw_error;
 
 	struct ICARUS_HISTORY *history0, *history;
 	int count;
@@ -652,6 +666,17 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 	elapsed.tv_sec = elapsed.tv_usec = 0;
 
 	icarus = thr->cgpu;
+	if (icarus->device_fd == -1)
+		if (!icarus_prepare(thr)) {
+			applog(LOG_ERR, "ICA%i: Comms error", icarus->device_id);
+			icarus->device_last_not_well = time(NULL);
+			icarus->device_not_well_reason = REASON_DEV_COMMS_ERROR;
+			icarus->dev_comms_error_count++;
+
+			// fail the device if the reopen attempt fails
+			return -1;
+		}
+
 	fd = icarus->device_fd;
 
 	memset(ob_bin, 0, sizeof(ob_bin));
@@ -663,30 +688,41 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 	tcflush(fd, TCOFLUSH);
 #endif
 	ret = icarus_write(fd, ob_bin, sizeof(ob_bin));
-	if (ret)
-		return -1;	/* This should never happen */
+	if (ret) {
+		do_icarus_close(thr);
+		applog(LOG_ERR, "ICA%i: Comms error", icarus->device_id);
+		icarus->device_last_not_well = time(NULL);
+		icarus->device_not_well_reason = REASON_DEV_COMMS_ERROR;
+		icarus->dev_comms_error_count++;
+		return 0;	/* This should never happen */
+	}
 
 	gettimeofday(&tv_start, NULL);
 
 	if (opt_debug) {
 		ob_hex = bin2hex(ob_bin, sizeof(ob_bin));
-		if (ob_hex) {
-			applog(LOG_DEBUG, "Icarus %d sent: %s",
-				icarus->device_id, ob_hex);
-			free(ob_hex);
-		}
+		applog(LOG_DEBUG, "Icarus %d sent: %s",
+			icarus->device_id, ob_hex);
+		free(ob_hex);
 	}
 
 	/* Icarus will return 4 bytes (ICARUS_READ_SIZE) nonces or nothing */
 	memset(nonce_bin, 0, sizeof(nonce_bin));
 	info = icarus_info[icarus->device_id];
 	ret = icarus_gets(nonce_bin, fd, &tv_finish, thr, info->read_count);
+	if (ret == ICA_GETS_ERROR) {
+		do_icarus_close(thr);
+		applog(LOG_ERR, "ICA%i: Comms error", icarus->device_id);
+		icarus->device_last_not_well = time(NULL);
+		icarus->device_not_well_reason = REASON_DEV_COMMS_ERROR;
+		icarus->dev_comms_error_count++;
+		return 0;
+	}
 
 	work->blk.nonce = 0xffffffff;
-	memcpy((char *)&nonce, nonce_bin, sizeof(nonce_bin));
 
 	// aborted before becoming idle, get new work
-	if (nonce == 0 && ret) {
+	if (ret == ICA_GETS_TIMEOUT || ret == ICA_GETS_RESTART) {
 		timersub(&tv_finish, &tv_start, &elapsed);
 
 		// ONLY up to just when it aborted
@@ -708,11 +744,19 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 		return estimate_hashes;
 	}
 
+	memcpy((char *)&nonce, nonce_bin, sizeof(nonce_bin));
+
 #if !defined (__BIG_ENDIAN__) && !defined(MIPSEB)
 	nonce = swab32(nonce);
 #endif
 
+	curr_hw_errors = icarus->hw_errors;
 	submit_nonce(thr, work, nonce);
+	was_hw_error = (curr_hw_errors > icarus->hw_errors);
+
+	// Force a USB close/reopen on any hw error
+	if (was_hw_error)
+		do_icarus_close(thr);
 
 	hash_count = (nonce & info->nonce_mask);
 	hash_count++;
@@ -726,8 +770,9 @@ static int64_t icarus_scanhash(struct thr_info *thr, struct work *work,
 				icarus->device_id, nonce, hash_count, elapsed.tv_sec, elapsed.tv_usec);
 	}
 
-	// ignore possible end condition values
+	// ignore possible end condition values ... and hw errors
 	if (info->do_icarus_timing
+	&&  !was_hw_error
 	&&  ((nonce & info->nonce_mask) > END_CONDITION)
 	&&  ((nonce & info->nonce_mask) < (info->nonce_mask & ~END_CONDITION))) {
 		gettimeofday(&tv_history_start, NULL);
@@ -858,8 +903,7 @@ static struct api_data *icarus_api_stats(struct cgpu_info *cgpu)
 
 static void icarus_shutdown(struct thr_info *thr)
 {
-	struct cgpu_info *icarus = thr->cgpu;
-	icarus_close(icarus->device_fd);
+	do_icarus_close(thr);
 }
 
 struct device_api icarus_api = {

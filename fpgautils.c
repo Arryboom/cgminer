@@ -33,13 +33,12 @@
 #endif
 
 #include "elist.h"
-#include "fpgautils.h"
 #include "logging.h"
 #include "miner.h"
+#include "fpgautils.h"
 
 #ifdef HAVE_LIBUDEV
-int
-serial_autodetect_udev(detectone_func_t detectone, const char*prodname)
+int serial_autodetect_udev(detectone_func_t detectone, const char*prodname)
 {
 	struct udev *udev = udev_new();
 	struct udev_enumerate *enumerate = udev_enumerate_new(udev);
@@ -69,15 +68,13 @@ serial_autodetect_udev(detectone_func_t detectone, const char*prodname)
 	return found;
 }
 #else
-int
-serial_autodetect_udev(__maybe_unused detectone_func_t detectone, __maybe_unused const char*prodname)
+int serial_autodetect_udev(__maybe_unused detectone_func_t detectone, __maybe_unused const char*prodname)
 {
 	return 0;
 }
 #endif
 
-int
-serial_autodetect_devserial(detectone_func_t detectone, const char*prodname)
+int serial_autodetect_devserial(__maybe_unused detectone_func_t detectone, __maybe_unused const char*prodname)
 {
 #ifndef WIN32
 	DIR *D;
@@ -107,30 +104,32 @@ serial_autodetect_devserial(detectone_func_t detectone, const char*prodname)
 #endif
 }
 
-int
-_serial_detect(const char*dname, detectone_func_t detectone, autoscan_func_t autoscan, bool forceauto)
+int _serial_detect(struct device_api *api, detectone_func_t detectone, autoscan_func_t autoscan, bool forceauto)
 {
 	struct string_elist *iter, *tmp;
-	const char*s, *p;
+	const char *dev, *colon;
 	bool inhibitauto = false;
 	char found = 0;
-	size_t dnamel = strlen(dname);
+	size_t namel = strlen(api->name);
+	size_t dnamel = strlen(api->dname);
 
 	list_for_each_entry_safe(iter, tmp, &scan_devices, list) {
-		s = iter->string;
-		if ((p = strchr(s, ':')) && p[1] != '\0') {
-			size_t plen = p - s;
-			if (plen != dnamel || strncasecmp(s, dname, plen))
+		dev = iter->string;
+		if ((colon = strchr(dev, ':')) && colon[1] != '\0') {
+			size_t idlen = colon - dev;
+
+			// allow either name:device or dname:device
+			if ((idlen != namel || strncasecmp(dev, api->name, idlen))
+			&&  (idlen != dnamel || strncasecmp(dev, api->dname, idlen)))
 				continue;
-			s = p + 1;
+
+			dev = colon + 1;
 		}
-		if (!strcmp(s, "auto"))
+		if (!strcmp(dev, "auto"))
 			forceauto = true;
-		else
-		if (!strcmp(s, "noauto"))
+		else if (!strcmp(dev, "noauto"))
 			inhibitauto = true;
-		else
-		if (detectone(s)) {
+		else if (detectone(dev)) {
 			string_elist_del(iter);
 			inhibitauto = true;
 			++found;
@@ -311,8 +310,7 @@ void termios_debug(const char *devpath, struct termios *my_termios, const char *
 #endif
 #endif
 
-int
-serial_open(const char*devpath, unsigned long baud, signed short timeout, bool purge)
+int serial_open(const char *devpath, unsigned long baud, signed short timeout, bool purge)
 {
 #ifdef WIN32
 	HANDLE hSerial = CreateFile(devpath, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
@@ -429,8 +427,7 @@ serial_open(const char*devpath, unsigned long baud, signed short timeout, bool p
 #endif
 }
 
-ssize_t
-_serial_read(int fd, char *buf, size_t bufsiz, char *eol)
+ssize_t _serial_read(int fd, char *buf, size_t bufsiz, char *eol)
 {
 	ssize_t len, tlen = 0;
 	while (bufsiz) {
@@ -446,8 +443,7 @@ _serial_read(int fd, char *buf, size_t bufsiz, char *eol)
 	return tlen;
 }
 
-static FILE*
-_open_bitstream(const char*path, const char*subdir, const char*filename)
+static FILE *_open_bitstream(const char *path, const char *subdir, const char *filename)
 {
 	char fullpath[PATH_MAX];
 	strcpy(fullpath, path);
@@ -471,8 +467,7 @@ _open_bitstream(const char*path, const char*subdir, const char*filename)
 	_open_bitstream(path, NULL);  \
 } while(0)
 
-FILE*
-open_bitstream(const char*dname, const char*filename)
+FILE *open_bitstream(const char *dname, const char *filename)
 {
 	FILE *f;
 
@@ -482,3 +477,96 @@ open_bitstream(const char*dname, const char*filename)
 
 	return NULL;
 }
+
+#ifndef WIN32
+
+static bool _select_wait_read(int fd, struct timeval *timeout)
+{
+	fd_set rfds;
+
+	FD_ZERO(&rfds);
+	FD_SET(fd, &rfds);
+
+	if (select(fd+1, &rfds, NULL, NULL, timeout) > 0)
+		return true;
+	else
+		return false;
+}
+
+// Default timeout 100ms - only for device initialisation
+const struct timeval tv_timeout_default = { 0, 100000 };
+// Default inter character timeout = 1ms - only for device initialisation
+const struct timeval tv_inter_char_default = { 0, 1000 };
+
+// Device initialisation function - NOT for work processing
+size_t _select_read(int fd, char *buf, size_t bufsiz, struct timeval *timeout, struct timeval *char_timeout, int finished)
+{
+	struct timeval tv_time, tv_char;
+	ssize_t siz, red = 0;
+	char got;
+
+	// timeout is the maximum time to wait for the first character
+	tv_time.tv_sec = timeout->tv_sec;
+	tv_time.tv_usec = timeout->tv_usec;
+
+	if (!_select_wait_read(fd, &tv_time))
+		return 0;
+
+	while (4242) {
+		if ((siz = read(fd, buf, 1)) < 0)
+			return red;
+
+		got = *buf;
+		buf += siz;
+		red += siz;
+		bufsiz -= siz;
+
+		if (bufsiz < 1 || (finished >= 0 && got == finished))
+			return red;
+
+		// char_timeout is the maximum time to wait for each subsequent character
+		// this is OK for initialisation, but bad for work processing
+		// work processing MUST have a fixed size so this doesn't come into play
+		tv_char.tv_sec = char_timeout->tv_sec;
+		tv_char.tv_usec = char_timeout->tv_usec;
+
+		if (!_select_wait_read(fd, &tv_char))
+			return red;
+	}
+
+	return red;
+}
+
+// Device initialisation function - NOT for work processing
+size_t _select_write(int fd, char *buf, size_t siz, struct timeval *timeout)
+{
+	struct timeval tv_time, tv_now, tv_finish;
+	fd_set rfds;
+	ssize_t wrote = 0, ret;
+
+	gettimeofday(&tv_now, NULL);
+	timeradd(&tv_now, timeout, &tv_finish);
+
+	// timeout is the maximum time to spend trying to write
+	tv_time.tv_sec = timeout->tv_sec;
+	tv_time.tv_usec = timeout->tv_usec;
+
+	FD_ZERO(&rfds);
+	FD_SET(fd, &rfds);
+
+	while (siz > 0 && (tv_now.tv_sec < tv_finish.tv_sec || (tv_now.tv_sec == tv_finish.tv_sec && tv_now.tv_usec < tv_finish.tv_usec)) && select(fd+1, NULL, &rfds, NULL, &tv_time) > 0) {
+		if ((ret = write(fd, buf, 1)) > 0) {
+			buf++;
+			wrote++;
+			siz--;
+		}
+		else if (ret < 0)
+			return wrote;
+
+		gettimeofday(&tv_now, NULL);
+	}
+
+	return wrote;
+}
+
+#endif // ! WIN32

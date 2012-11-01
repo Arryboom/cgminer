@@ -1,8 +1,8 @@
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_maj], [2])
-m4_define([v_min], [7])
-m4_define([v_mic], [5])
+m4_define([v_min], [8])
+m4_define([v_mic], [7])
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_ver], [v_maj.v_min.v_mic])
 m4_define([lt_rev], m4_eval(v_maj + v_min))
@@ -79,19 +79,13 @@ case $target in
 esac
 
 case $target in
-	x86_64-w64-mingw32)
-	have_x86_64=true
-	have_win32=true
-	PTHREAD_FLAGS=""
-	DLOPEN_FLAGS=""
-	WS2_LIBS="-lws2_32"
-	;;
   *-*-mingw*)
     have_x86_64=false
     have_win32=true
     PTHREAD_FLAGS=""
     DLOPEN_FLAGS=""
     WS2_LIBS="-lws2_32"
+    AC_DEFINE([_WIN32_WINNT], [0x0501], "WinNT version for XP+ support")
     ;;
   powerpc-*-darwin*)
     CFLAGS="$CFLAGS -faltivec"
@@ -104,14 +98,23 @@ case $target in
 	;;
 esac
 
-if test "x$ATISTREAMSDKROOT" != x; then
+
+if test "x$have_win32" != xtrue; then
 	if test "x$have_x86_64" = xtrue; then
-		ATI_STREAM_ARCH_DIR=x86_64
+		ARCH_DIR=x86_64
 	else
-		ATI_STREAM_ARCH_DIR=x86
+		ARCH_DIR=x86
 	fi
-	OPENCL_FLAGS="-I$ATISTREAMSDKROOT/include $OPENCL_FLAGS"
-	OPENCL_LIBS="-L$ATISTREAMSDKROOT/lib/$ATI_STREAM_ARCH_DIR $OPENCL_LIBS"
+
+	if test "x$ATISTREAMSDKROOT" != x; then
+		OPENCL_FLAGS="-I$ATISTREAMSDKROOT/include $OPENCL_FLAGS"
+		OPENCL_LIBS="-L$ATISTREAMSDKROOT/lib/$ARCH_DIR $OPENCL_LIBS"
+	fi
+
+	if test "x$AMDAPPSDKROOT" != x; then
+		OPENCL_FLAGS="-I$AMDAPPSDKROOT/include $OPENCL_FLAGS"
+		OPENCL_LIBS="-L$AMDAPPSDKROOT/lib/$ARCH_DIR $OPENCL_LIBS"
+	fi
 fi
 
 cpumining="no"
@@ -347,8 +350,7 @@ fi
 
 PKG_PROG_PKG_CONFIG()
 
-PKG_CHECK_MODULES([LIBCURL], [libcurl >= 7.15.6], [AC_DEFINE([CURL_HAS_SOCKOPT], [1], [Defined if version of curl supports sockopts.])],
-[PKG_CHECK_MODULES([LIBCURL], [libcurl >= 7.10.1], ,[AC_MSG_ERROR([Missing required libcurl dev >= 7.10.1])])])
+PKG_CHECK_MODULES([LIBCURL], [libcurl >= 7.18.2], ,[AC_MSG_ERROR([Missing required libcurl dev >= 7.18.2])])
 AC_SUBST(LIBCURL_LIBS)
 
 dnl CCAN wants to know a lot of vars.
@@ -389,11 +391,11 @@ fi
 
 AC_DEFINE_UNQUOTED([CGMINER_PREFIX], ["$prefix/bin"], [Path to cgminer install])
 
-AC_DEFINE_UNQUOTED([PHATK_KERNNAME], ["phatk120823"], [Filename for phatk kernel])
-AC_DEFINE_UNQUOTED([POCLBM_KERNNAME], ["poclbm120823"], [Filename for poclbm kernel])
-AC_DEFINE_UNQUOTED([DIAKGCN_KERNNAME], ["diakgcn120823"], [Filename for diakgcn kernel])
-AC_DEFINE_UNQUOTED([DIABLO_KERNNAME], ["diablo120823"], [Filename for diablo kernel])
-AC_DEFINE_UNQUOTED([SCRYPT_KERNNAME], ["scrypt120823"], [Filename for scrypt kernel])
+AC_DEFINE_UNQUOTED([PHATK_KERNNAME], ["phatk121016"], [Filename for phatk kernel])
+AC_DEFINE_UNQUOTED([POCLBM_KERNNAME], ["poclbm121016"], [Filename for poclbm kernel])
+AC_DEFINE_UNQUOTED([DIAKGCN_KERNNAME], ["diakgcn121016"], [Filename for diakgcn kernel])
+AC_DEFINE_UNQUOTED([DIABLO_KERNNAME], ["diablo121016"], [Filename for diablo kernel])
+AC_DEFINE_UNQUOTED([SCRYPT_KERNNAME], ["scrypt121016"], [Filename for scrypt kernel])
 
 
 AC_SUBST(OPENCL_LIBS)

@@ -12,6 +12,7 @@
 #include "elist.h"
 #include "uthash.h"
 #include "logging.h"
+#include "util.h"
 
 #ifdef HAVE_OPENCL
 #ifdef __APPLE_CC__
@@ -50,6 +51,19 @@ extern "C"
 void *alloca (size_t);
 # endif
 #endif
+
+#ifdef __MINGW32__
+#include <windows.h>
+#include <io.h>
+static inline int fsync (int fd)
+{
+	return (FlushFileBuffers ((HANDLE) _get_osfhandle (fd))) ? 0 : -1;
+}
+
+#ifndef MSG_DONTWAIT
+# define MSG_DONTWAIT 0x1000000
+#endif
+#endif /* __MINGW32__ */
 
 #if defined (__linux)
  #ifndef LINUX
@@ -125,14 +139,19 @@ void *alloca (size_t);
 #endif
 #endif /* !defined(__GLXBYTEORDER_H__) */
 
-/* This assumes htobe32 is a macro in endian.h */
+/* This assumes htobe32 is a macro in endian.h, and if it doesn't exist, then
+ * htobe64 also won't exist */
 #ifndef htobe32
 # if __BYTE_ORDER == __LITTLE_ENDIAN
 #  define be32toh(x) bswap_32(x)
+#  define be64toh(x) bswap_64(x)
 #  define htobe32(x) bswap_32(x)
+#  define htobe64(x) bswap_64(x)
 # elif __BYTE_ORDER == __BIG_ENDIAN
 #  define be32toh(x) (x)
+#  define be64toh(x) (x)
 #  define htobe32(x) (x)
+#  define htobe64(x) (x)
 #else
 #error UNKNOWN BYTE ORDER
 #endif
@@ -239,6 +258,7 @@ struct device_api {
 	void (*get_statline)(char*, struct cgpu_info*);
 	struct api_data *(*get_api_stats)(struct cgpu_info*);
 	bool (*get_stats)(struct cgpu_info*);
+	void (*identify_device)(struct cgpu_info*); // e.g. to flash a led
 
 	// Thread-specific functions
 	bool (*thread_prepare)(struct thr_info*);
@@ -247,6 +267,7 @@ struct device_api {
 	void (*free_work)(struct thr_info*, struct work*);
 	bool (*prepare_work)(struct thr_info*, struct work*);
 	int64_t (*scanhash)(struct thr_info*, struct work*, int64_t);
+	void (*hw_error)(struct thr_info*);
 	void (*thread_shutdown)(struct thr_info*);
 	void (*thread_enable)(struct thr_info*);
 };
@@ -276,6 +297,7 @@ enum dev_reason {
 	REASON_DEV_OVER_HEAT,
 	REASON_DEV_THERMAL_CUTOFF,
 	REASON_DEV_COMMS_ERROR,
+	REASON_DEV_THROTTLE,
 };
 
 #define REASON_NONE			"None"
@@ -288,6 +310,7 @@ enum dev_reason {
 #define REASON_DEV_OVER_HEAT_STR	"Device over heated"
 #define REASON_DEV_THERMAL_CUTOFF_STR	"Device reached thermal cutoff"
 #define REASON_DEV_COMMS_ERROR_STR	"Device comms error"
+#define REASON_DEV_THROTTLE_STR		"Device throttle"
 #define REASON_UNKNOWN_STR		"Unknown reason - code bug"
 
 #define MIN_SEC_UNSET 99999999
@@ -311,6 +334,11 @@ struct cgminer_pool_stats {
 	bool canroll;
 	bool hadexpire;
 	uint32_t rolltime;
+	double min_diff;
+	double max_diff;
+	double last_diff;
+	uint32_t min_diff_count;
+	uint32_t max_diff_count;
 };
 
 struct cgpu_info {
@@ -335,6 +363,7 @@ struct cgpu_info {
 	uint32_t nonces;
 	bool nonce_range;
 	bool polling;
+	bool flash_led;
 #endif
 	pthread_mutex_t		device_mutex;
 
@@ -369,13 +398,11 @@ struct cgpu_info {
 
 #ifdef USE_SCRYPT
 	int opt_lg, lookup_gap;
-	int opt_tc, thread_concurrency;
-	int shaders;
+	size_t opt_tc, thread_concurrency;
+	size_t shaders;
 #endif
 	struct timeval tv_gpustart;
-	struct timeval tv_gpumid;
-	double gpu_us_average;
-	int intervals, hit;
+	int intervals;
 #endif
 
 	bool new_work;
@@ -396,8 +423,12 @@ struct cgpu_info {
 	int gpu_powertune;
 	float gpu_vddc;
 #endif
+	int diff1;
+	double diff_accepted;
+	double diff_rejected;
 	int last_share_pool;
 	time_t last_share_pool_time;
+	double last_share_diff;
 
 	time_t device_last_well;
 	time_t device_last_not_well;
@@ -411,6 +442,7 @@ struct cgpu_info {
 	int dev_over_heat_count;	// It's a warning but worth knowing
 	int dev_thermal_cutoff_count;
 	int dev_comms_error_count;
+	int dev_throttle_count;
 
 	struct cgminer_stats cgminer_stats;
 };
@@ -450,6 +482,7 @@ extern void thr_info_cancel(struct thr_info *thr);
 extern void thr_info_freeze(struct thr_info *thr);
 extern void nmsleep(unsigned int msecs);
 extern double us_tdiff(struct timeval *end, struct timeval *start);
+extern double tdiff(struct timeval *end, struct timeval *start);
 
 struct string_elist {
 	char *string;
@@ -494,6 +527,21 @@ static inline void swap256(void *dest_p, const void *src_p)
 	dest[5] = src[2];
 	dest[6] = src[1];
 	dest[7] = src[0];
+}
+
+static inline void swab256(void *dest_p, const void *src_p)
+{
+	uint32_t *dest = dest_p;
+	const uint32_t *src = src_p;
+
+	dest[0] = swab32(src[7]);
+	dest[1] = swab32(src[6]);
+	dest[2] = swab32(src[5]);
+	dest[3] = swab32(src[4]);
+	dest[4] = swab32(src[3]);
+	dest[5] = swab32(src[2]);
+	dest[6] = swab32(src[1]);
+	dest[7] = swab32(src[0]);
 }
 
 extern void quit(int status, const char *format, ...);
@@ -576,9 +624,11 @@ extern bool opt_delaynet;
 extern bool opt_restart;
 extern char *opt_icarus_options;
 extern char *opt_icarus_timing;
+extern bool opt_worktime;
 #ifdef USE_BITFORCE
 extern bool opt_bfl_noncerange;
 #endif
+extern int swork_id;
 
 extern pthread_rwlock_t netacc_lock;
 
@@ -586,6 +636,8 @@ extern const uint32_t sha256_init_state[];
 extern json_t *json_rpc_call(CURL *curl, const char *url, const char *userpass,
 			     const char *rpc_req, bool, bool, int *,
 			     struct pool *pool, bool);
+extern const char *proxytype(curl_proxytype proxytype);
+extern char *get_proxy(char *url, struct pool *pool);
 extern char *bin2hex(const unsigned char *p, size_t len);
 extern bool hex2bin(unsigned char *p, const char *hexstr, size_t len);
 
@@ -599,7 +651,9 @@ typedef bool (*sha256_func)(struct thr_info*, const unsigned char *pmidstate,
 
 extern bool fulltest(const unsigned char *hash, const unsigned char *target);
 
+extern int opt_queue;
 extern int opt_scantime;
+extern int opt_expiry;
 
 extern pthread_mutex_t console_lock;
 extern pthread_mutex_t ch_lock;
@@ -626,7 +680,9 @@ extern void api(int thr_id);
 
 extern struct pool *current_pool(void);
 extern int enabled_pools;
-extern void add_pool_details(bool live, char *url, char *user, char *pass);
+extern bool detect_stratum(struct pool *pool, char *url);
+extern struct pool *add_pool(void);
+extern void add_pool_details(struct pool *pool, bool live, char *url, char *user, char *pass);
 
 #define MAX_GPUDEVICES 16
 
@@ -672,6 +728,7 @@ extern unsigned int new_blocks;
 extern unsigned int found_blocks;
 extern int total_accepted, total_rejected, total_diff1;;
 extern int total_getworks, total_stale, total_discarded;
+extern double total_diff_accepted, total_diff_rejected, total_diff_stale;
 extern unsigned int local_work;
 extern unsigned int total_go, total_ro;
 extern const int opt_cutofftemp;
@@ -728,13 +785,36 @@ enum pool_enable {
 	POOL_REJECTING,
 };
 
+struct stratum_work {
+	char *job_id;
+	char *prev_hash;
+	char *coinbase1;
+	char *coinbase2;
+	char **merkle;
+	char *bbversion;
+	char *nbit;
+	char *ntime;
+	bool clean;
+
+	int merkles;
+	int diff;
+};
+
+#define RECVSIZE 8192
+#define RBUFSIZE (RECVSIZE + 4)
+
 struct pool {
 	int pool_no;
 	int prio;
 	int accepted, rejected;
 	int seq_rejects;
+	int seq_getfails;
 	int solved;
 	int diff1;
+
+	double diff_accepted;
+	double diff_rejected;
+	double diff_stale;
 
 	int queued;
 	int staged;
@@ -764,6 +844,8 @@ struct pool {
 	char *rpc_url;
 	char *rpc_userpass;
 	char *rpc_user, *rpc_pass;
+	curl_proxytype rpc_proxytype;
+	char *rpc_proxy;
 
 	pthread_mutex_t pool_lock;
 
@@ -779,10 +861,34 @@ struct pool {
 	struct list_head curlring;
 
 	time_t last_share_time;
+	double last_share_diff;
 
 	struct cgminer_stats cgminer_stats;
 	struct cgminer_pool_stats cgminer_pool_stats;
+
+	/* Stratum variables */
+	char *stratum_url;
+	char *stratum_port;
+	CURL *stratum_curl;
+	SOCKETTYPE sock;
+	char sockbuf[RBUFSIZE];
+	char *sockaddr_url; /* stripped url used for sockaddr */
+	char *nonce1;
+	uint32_t nonce2;
+	int n2size;
+	bool has_stratum;
+	bool stratum_active;
+	bool stratum_auth;
+	struct stratum_work swork;
+	pthread_t stratum_thread;
+	pthread_mutex_t stratum_lock;
 };
+
+#define GETWORK_MODE_TESTPOOL 'T'
+#define GETWORK_MODE_POOL 'P'
+#define GETWORK_MODE_LP 'L'
+#define GETWORK_MODE_BENCHMARK 'B'
+#define GETWORK_MODE_STRATUM 'S'
 
 struct work {
 	unsigned char	data[128];
@@ -791,10 +897,10 @@ struct work {
 	unsigned char	target[32];
 	unsigned char	hash[32];
 
+	uint32_t	outputhash;
+
 	int		rolls;
 
-	uint32_t	output[1];
-	uint32_t	valid;
 	dev_blk_ctx	blk;
 
 	struct thr_info	*thr;
@@ -812,11 +918,26 @@ struct work {
 	bool		block;
 	bool		queued;
 
+	bool		stratum;
+	/* These are arbitrary lengths as it is too hard to keep track of
+	 * dynamically allocated ram in work structs */
+	char 		job_id[64];
+	char		nonce2[64];
+	char		ntime[16];
+	int		sdiff;
+
 	unsigned int	work_block;
 	int		id;
-	UT_hash_handle hh;
+	UT_hash_handle	hh;
 
-	time_t share_found_time;
+	double		work_difficulty;
+
+	struct timeval	tv_getwork;
+	struct timeval	tv_getwork_reply;
+	struct timeval	tv_cloned;
+	struct timeval	tv_work_start;
+	struct timeval	tv_work_found;
+	char		getwork_mode;
 };
 
 #ifdef USE_MODMINER 
@@ -829,16 +950,18 @@ struct modminer_fpga_state {
 	char next_work_cmd[46];
 
 	unsigned char clock;
-	int no_nonce_counter;
-	int good_share_counter;
-	time_t last_cutoff_reduced;
+	float temp;
 
-	unsigned char temp;
+	uint32_t shares;
+	uint32_t shares_last_hw;
+	uint32_t hw_errors;
+	uint32_t shares_to_good;
+	struct timeval last_changed;
+	uint32_t no_nonce_counter;
 };
 #endif
 
 extern void get_datestamp(char *, struct timeval *);
-extern bool test_nonce(struct work *work, uint32_t nonce);
 bool submit_nonce(struct thr_info *thr, struct work *work, uint32_t nonce);
 extern void tailsprintf(char *f, const char *fmt, ...);
 extern void wlogprint(const char *f, ...);
@@ -881,7 +1004,8 @@ enum api_data_type {
 	API_UTILITY,
 	API_FREQ,
 	API_VOLTS,
-	API_HS
+	API_HS,
+	API_DIFF
 };
 
 struct api_data {
@@ -912,5 +1036,6 @@ extern struct api_data *api_add_utility(struct api_data *root, char *name, doubl
 extern struct api_data *api_add_freq(struct api_data *root, char *name, double *data, bool copy_data);
 extern struct api_data *api_add_volts(struct api_data *root, char *name, float *data, bool copy_data);
 extern struct api_data *api_add_hs(struct api_data *root, char *name, double *data, bool copy_data);
+extern struct api_data *api_add_diff(struct api_data *root, char *name, double *data, bool copy_data);
 
 #endif /* __MINER_H__ */

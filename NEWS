@@ -1,3 +1,380 @@
+Version 2.8.7 - October 29, 2012
+
+- Fail on select() failing in stratum thread without needing to attempt
+recv_line.
+- Add share to stratum database before sending it again in case we get a
+response from the pool before it's added.
+
+
+Version 2.8.6 - October 29, 2012
+
+- Shorten the initiate stratum connect timeout to 30 seconds.
+- Shorten the stratum timeout on read to 90 seconds to detect unresponsive pool.
+- Display best share difficulty on exit.
+- Make stratum socket fail more robust on windows by disabling the send buffer.
+- Reuse the same curl handle forcing a new connection instead of risking
+derefencing.
+- Add information about submission failure to stratum send.
+- Only add stratum share to database if we succeeded in submitting it, with a
+debug output saying it succeeded.
+- Use keepalive with stratum sockets to improve its ability to detect broken
+connections.
+- Show only the URL in the status bar to avoid long prefixes making for extra
+long lines.
+- Display compact status in menu and update README to reflect current menu
+entries.
+- Add a compact display mode that does not list per device statistics in the
+status window.
+- Add blank spaces after best share displayed.
+- Round a few static string arrays up to 4 byte boundaries for ARM.
+- Display best share diff for scrypt as well.
+- Show the best diff share as "best share" and add info to the README.
+- Display the best diff share submitted so far.
+- Redundant check.
+- The work struct pointer in struct pc_data in findnonce is never freed yet
+there is no need to allocate it separately so make struct work a static part of
+the struct pc_data. s
+
+
+Version 2.8.5 - October 23, 2012
+
+- Handle crash exceptions by trying to restart cgminer unless the --no-restart
+option is used.
+- Switch queued count when choosing a different pool from a failed stratum pool
+in getwork thread.
+- Put a mandatory 5s wait between reattempting a getwork on failure to avoid
+hammering requests.
+- The ATI stream / AMD APP SDK environment variables appear to only interfere
+with win32 builds so bypass them.
+- Make sure to check pool stratum curl exists under lock before attempting any
+recv to not risk dereferencing upon attempting to reinitiate stratum.
+- Avoid redefining macros and align to 4 byte boundaries.
+- API - add Stratum information to pools
+- update FPGA-README for MMQ
+
+
+Version 2.8.4 - October 18, 2012
+
+- Time for dynamic is in microseconds, not ms.
+- x86_64 builds of mingw32 are not supported directly and should just configure
+as generic mingw32 builds since they're NOT 64 bit.
+- Cope with both ATI stream and AMD APP SDK roots being set when building.
+- Use 3 significant digits when suffix string is used and values are >1000.
+- MMQ new initialisation (that works) and clocking control
+- Get rid of unused warning for !scrypt.
+- Use select on stratum send to make sure the socket is writeable.
+- Cope with dval being zero in suffix_string and display a single decimal place
+when significant digits is not specified but the value is greater than 1000.
+- Pad out the suffix string function with zeroes on the right.
+- Failure to calloc in bin2hex is a fatal failure always so just check for that
+failure within the function and abort, simplifying the rest of the code.
+- Provide locking around the change of the stratum curl structures to avoid
+possible races.
+- Bump opencl kernel version numbers.
+- Remove atomic ops from opencl kernels given rarity of more than once nonce on
+the same wavefront and the potential increased ramspeed requirements to use the
+atomics.
+- Clear the pool idle flag in stratum when it comes back to life.
+- Display correct share hash and share difficulty with scrypt mining.
+- Use explicit host to BE functions in scrypt code instead of hard coding
+byteswap everywhere.
+- Show work target diff for scrypt mining.
+- Ease the checking on allocation of padbuffer8 in the hope it works partially
+anyway on an apparently failed call.
+- Watch for buffer overflows on receiving data into the socket buffer.
+- Round target difficulties down to be in keeping with the rounding of detected
+share difficulties.
+- Dramatically simplify the dynamic intensity calculation by oversampling many
+runs through the opencl kernel till we're likely well within the timer
+resolution on windows.
+- String alignment to 4 byte boundaries and optimisations for bin<->hex
+conversions.
+- In opencl_free_work, make sure to still flush results in dynamic mode.
+- Align static arrays to 4 byte boundaries to appease ARM builds for stratum.
+
+
+Version 2.8.3 - October 12, 2012
+
+- Left align values that are suffix_string generated.
+- Share_diff should not be converting the work data to hex.
+- Off by one error.
+- Prevent overflows of the port char array in extract_sockaddr.
+- Disable stratum detection with scrypt.
+- Use the suffix string function when displaying device hashrates.
+- Be consistent with the get_statline function.
+- Use the suffix string function for displaying hashrate with 4 significant
+digits.
+- Display the actual share diff next to the pool required diff, using a suffix
+creation function to prevent values of >1000 being shown in their entirety.
+- Fix 4 * 0 being 0 that would break dynamic intensity mode.
+- Fix wrong byteswap macro being used on mingw32 which was breaking target
+generation on stratum.
+
+
+Version 2.8.2 - October 11, 2012
+
+- Reinstate the history on dynamic intensity mode to damp fluctuations in
+intensity but use an upper limit on how much the value can increase at any time
+to cope with rare overflows.
+- Create a fix-protocol option which prevents cgminer from switching to stratum
+if it's detected.
+- Simplify target generation code.
+- Add support for client.get_version for stratum.
+- Use a 64 bit unsigned integer on the diff target to generate the hex target.
+- Update reconnect message to show whole address including port.
+- Look for null values and parse correct separate array entries for url and port
+with client reconnect commands for stratum.
+- The command for stratum is client.reconnect, not mining.reconnect.
+- Only copy the stratum url to the rpc url if an rpc url does not exist.
+- Implement rudimentary mining.reconnect support for stratum.
+- Ignore the value of stratum_active on calling initiate_stratum and assume
+we're always trying to reinitiate it, and set the active flag to false in that
+function.
+- stratum auth can be unset if we fail to authorise on subsequent calls to
+auth_stratum which undoes the requirement of setting it in one place so set it
+in pool_active.
+
+
+Version 2.8.1 - October 8, 2012
+
+- Use the stratum url as the rpc url advertised if we switch to it.
+- Count an invalid nonce count as a hardware error on opencl.
+- Count each stratum work item as local work.
+- Cope with one stratum pool being the only active pool when it dies by sleeping
+for 5 seconds before retrying to get work from it instead of getting work
+indefinitely.
+- Detect stratum outage based on either select timing out or receiving an empty
+buffer and properly re-establish connection by disabling the stratum_active
+flag, coping with empty buffers in parse_stratum.
+
+
+Version 2.8.0 - October 7, 2012
+
+- Major upgrade - support for the stratum mining protocol.
+- Fix various modminer warnings on mingw.
+- Fix sign warning on windows build for bitforce.
+- Cast socketfail to integer since SOCKET is an unsigned int on windows.
+- Use strtod not strtol for bitforce temp backup.
+- Cope with broken drivers returning nonsense values for bitforce temperatures.
+- Minor warning fixes.
+- Use the stratum thread to detect when a stratum pool has died based on no
+message for 2 minutes.
+- Only set the stratum auth flag once and once the stratum thread is started,
+use that to set/unset the stratum active flag.
+- Only hand off to stratum from getwork if we succeed in initiating the
+protocol.
+- Target should only be 32 bytes copied.
+- Use a static array for work submission data instead of stack memory.
+- Clear the buffer data before sprinting to it.
+- Clear work stratum strings before setting them and add them to debug output.
+- Drop stratum connect failed message to verbose level only since it's a regular
+probing message.
+- TCP Keepalive in curl is only in very recent versions and not required with
+regular messages on stratum anyway.
+- Move stratum sockets to curl infrastructure with locking around send+recv to
+begin support for proxies and ssl.
+- Make detect stratum fail if a proxy has been set up.
+- Stratum does not currently have any proxy support so do not try to switch to
+stratum if a proxy has been specified.
+- Windows doesn't work with MSG_PEEK on recv so move to a continuously updating
+buffer for incoming messages.
+- Alloca is unreliable on windows so use static arrays in util.c stratum code.
+- Begin support for mingw stratum build.
+- Add space to reject reason.
+- Parse the reject reason where possible from stratum share submission.
+- Pass json error value to share result function to be able to parse reject
+reason in stratum.
+- Don't try to parse unneeded parameters in response to mining.subscribe.
+- Remove the sshare hash entry if we failed to send it.
+- Change notify message to info level to avoid spamming repeatedly when a pool
+is down.
+- Check the stratum pool difference has not changed compared to the work diff
+when testing whether a share meets the target or not and retarget if necessary.
+- Bit error in target calculation for stratum.
+- Set work_block in gen_stratum_work for when work is reused to avoid thinking
+it's all stale.
+- Offset the current block detection to the prev block hash.
+- We should be testing for id_val, not id in parse stratum response.
+- Make target on stratum scale to any size by clearing sequential bits according
+to diff.
+- Correct target calculation in gen_stratum_work.
+- If a share result has an error code but still has an id, it is likely a
+reject, not an error.
+- Initiate stratum the first time in pool_active only, allowing us to switch to
+it on getting a failed getwork and detecting the presence of stratum on the url
+at that time.
+- Use 5 second timeout on sock full for now as a temporary workaround.
+- If no stratum url is set by the end of the detect stratum routine, copy the
+sockaddr url.
+- Make all buffers slightly larger to prevent overflow.
+- Make the stratum recv buffer larger than the recvsize.
+- Userpass needs to be copied to user and pass earlier to allow stratum
+authorisation to work with it.
+- Store a sockaddr url of the stripped url used in determining sockaddr to not
+confuse it with the stratum url and fix build warnings.
+- Decrease the queued count with stratum work once it's staged as well.
+- Allow the stratum retry to initiate and auth stratum in pool_alive to make
+sure the stratum thread is started.
+- Avoid duplicating pool->rpc_url and setting pool->stratum_url twice to itself.
+- Detect if a getwork based pool has the X-Stratum header on startup, and if so,
+switch to the stratum based pool.
+- Comment update.
+- Minor message change.
+- Create a work item from a "clean" request from stratum allowing the new block
+to be detected and the appropriate block change message to be given.
+- Use statically allocated stratum strings in struct work to cope with the
+inability to safely deallocate dynamically allocated ram.
+- Use the current pool when deciding whether to reuse work from a stratum source
+rather than the work's previous pool.
+- Copy the stratum url to the rpc url to avoid none being set.
+- Provide locking around stratum send operations to avoid races.
+- Submit shares from stratum through the abstracted submit share function
+detecting what message they belong to and showing the data from the associated
+work, and then deleting it from the hash.
+- Use a more robust mechanism to obtain a \n terminated string over a socket.
+- Abstract out share submit as a function to be useable by stratum.
+- Rename parse_stratum to parse_method as it is only for stratum messages that
+contain methods.
+- Display stratum as mechanism in status line when current pool is running it.
+- Count each stratum notify as a getwork equivalent.
+- Correct nonce submitted with share.
+- Extranonce2 should be added before coinbase2.
+- We should be hashing the binary coinbase, not the hex one.
+- Fix endianness of nonce submitted for stratum.
+- Check that stratum is already active in initiate_stratum to avoid
+de-authorising ourselves by subscribing again.
+- Begin implementing a hash database of submissions and attempt sending results.
+- Copy parameters from stratum work required for share submission.
+- Set lagging flag on first adding a pool to prevent pool slow warning at
+startup.
+- Fix work->target being a 32 byte binary in gen_stratum_work.
+- Store and display stripped url in its own variable.
+- Create machinery to divert work requests to stratum.
+- Generate the work target in gen_stratum_work, setting default diff to 1 in
+case it is not yet set.
+- Generate work data, midstate and hash1 in gen_stratum_work.
+- Generate header created from stratum structures in gen_stratum_work.
+- Generate merkle root hash in gen_stratum_work.
+- Generate the coinbase for generation of stratum based work.
+- The number of transactions is variable so make merkle a variable length
+dynamically allocated array and track how many there are for stratum.
+- Rename nonce2 to n2size reflecting that it's a size variable and not the
+actual nonce.
+- Provide rudimentary support for stratum clean work command in the stratum
+thread.
+- Cope with pools being removed in the stratum thread.
+- Use the pool sock value directly in the stratum thread in case it changes
+after reconnecting.
+- Create a stratum thread per pool that has stratum that monitors the socket and
+serves received data.
+- Check return value of stratum_parse.
+- Complete authorisation in stratum.
+- Implement stratum parsing of notify parameters and storing them in the pool
+stratum work structure.
+- Create helper functions for duplicating json strings to avoid keeping json
+references in use.
+- Append \n in the sock_send function instead of adding it when constructing
+json in stratum.
+- Don't keep any json references around with stratum structures.
+- Create parse_stratum function that hands off stratum parameters to other
+functions to manage pool stratum work struct variables. Implement mining
+difficulty setting.
+- Create helper functions for checking when a socket is ready to read on and
+receive a single line at a time. Begin stratum authorisation process.
+- Provide a helper function for reading a single \n terminated string from a
+socket.
+- Create a stratum work structure to store current work variables.
+- Test specifically for stratum being active in pool_active.
+- Detect stratum in common place when adding urls, and use a bool to tell us
+when it's active.
+- Fix warnings.
+- Extract and store various parameters on stratum init confirming successful
+mining notify.
+- Use existing socket macros and close the socket on failure in init stratum.
+- Initiate stratum and grab first json result.
+- Get detailed addressinfo from the parsed URL for future raw socket usage when
+possible. IPV4 only for now.
+- Prepare for getaddrinfo call.
+- Add data structures to pool struct for socket communications.
+- Put all socket definitions in util.h to allow reusing by added socket
+functions to be used in util.c.
+
+
+Version 2.7.7 - October 7, 2012
+
+- Fix unused warnings on ming build.
+- Fix sign warning in ocl.c
+- fds need to be zeroed before set in modminer.
+- Put scrypt warning on separate line to avoid 0 being shown on windows as
+bufsize.
+- Display correct pool number when block is found.
+- Prevent corrupt values returned from the opencl code from trying to read
+beyond the end of the buffer by masking the value to a max of 15.
+- Icarus USB write failure is also a comms error
+- api.c DEBUG message has no paramter
+- Icarus catch more USB errors and close/reopen the port
+- API-README update cgminer verison number
+- hashmeter fix stats kh/s on 32bit windows
+
+
+Version 2.7.6 - September 24, 2012
+
+- Reorder libztex header include order to fix missing struct definition.
+- Display share difficulty on log with a shortened hash display on submission.
+- API stats add some pool getwork difficulty stats
+- Ignore any pings pushed to the worker threads if the thread is still paused to
+prevent it being enabled and disabled repeatedly.
+- README - FAQ - usermod group - shouldn't remove other groups
+- Test for sequential getwork failures on a pool that might actually be up but
+failing to deliver work as we may end up hammering it repeatedly by mistake.
+- reduce windows compile warnings
+- util.c - bug - proxy - no data end condition
+- As we average gpu time over 5 work intervals for dynamic GPU intensity, there
+is no need to maintain a rolling average and it avoids the potential long term
+corruption of a single overflow value.
+- Test for the now-automatically exported variable AMDAPPSDKROOT when looking
+for the presence of the OpenCL headers.
+- API don't change 'Diff1 Shares' - backward compatability FTW
+- miner.php highlighting correctly handling difficulty
+- API - Add last share difficulty for devices and pool
+- Store and report Accepted,Rejected,Stale difficulty in the summary and API
+- WorkTime - display prevblock for scrypt
+- api.c remove compile warnings
+- Calculate work difficulty for each getwork and display with WorkTime debug
+- remove MMQ unused variable warning
+- FPGA - allow long or short device names in detect code + style police
+- WorkTime - multiple nonce per work and identify the work source
+- Optional WorkTime details with each Accepted/Rejected work item
+- Icarus - ignore hardware errors in timing mode
+- miner.php oops - mistype
+- miner.php by default don't display IP/Port numbers in error messages
+- api.c all STATUS messages automatically escaped
+- api.c add missing escape for comma in MSG_PGAUNW
+- API add display of and setting queue,scantime,expiry
+- HW: dont submit bad shares
+- save individual pool proxy settings to config
+- --default-config - allow command line to define the default configuration file
+for loading and saving
+- API-README update for pools proxy info
+- README URL proxy must use quote so show in the example
+- bug: remove proxy: from the front of the proxy used
+- CURL support for individual proxy per pool and all proxy types
+- README spelling/etc
+- README - FPGA device FAQ
+- HW: error counter auto for all devices - ztex code not fixed
+- API pgaidentify - unsupported message should be a warning
+- API/BFL identify a device - currently only BFL to flash the led
+- BFL add throttle count to internal stats + API
+- BFL: missing device id in log message
+- miner.php correct to new Diff1 Work field names
+- API add device diff1 work
+- API-README update
+- api.c Correct diff1 field name
+- count device diff1 shares
+- API-README more debug parameter information
+- API allow full debug settings control
+
+
 Version 2.7.5 - August 31, 2012
 
 - Adjust opencl intensity when adjusting thread count to prevent it getting
