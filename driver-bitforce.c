@@ -402,7 +402,6 @@ static bool bitforce_get_temp(struct cgpu_info *bitforce)
 	
 	if (unlikely(!pdevbuf[0])) {
 		applog(LOG_ERR, "BFL%i: Error: Get temp returned empty string/timed out", bitforce->device_id);
-		bitforce->hw_errors++;
 		return false;
 	}
 
@@ -418,14 +417,10 @@ static bool bitforce_get_temp(struct cgpu_info *bitforce)
 			bitforce->temp = temp;
 		}
 	} else {
-		/* Use the temperature monitor as a kind of watchdog for when
-		 * our responses are out of sync and flush the buffer to
-		 * hopefully recover */
-		applog(LOG_WARNING, "BFL%i: Garbled response probably throttling, clearing buffer", bitforce->device_id);
+		applog(LOG_WARNING, "BFL%i: Error: Get temp returned: %s", bitforce->device_id, pdevbuf);
 		bitforce->device_last_not_well = time(NULL);
-		bitforce->device_not_well_reason = REASON_DEV_THROTTLE;
-		bitforce->dev_throttle_count++;
-		/* Count throttling episodes as hardware errors */
+		bitforce->device_not_well_reason = REASON_DEV_COMMS_ERROR;
+		bitforce->dev_comms_error_count++;
 		bitforce->hw_errors++;
 		bitforce_clear_buffer(bitforce);
 		return false;
@@ -562,6 +557,7 @@ static int64_t bitforce_get_result(struct thr_info *thr, struct work *work)
 		bitforce->device_last_not_well = time(NULL);
 		bitforce->device_not_well_reason = REASON_DEV_OVER_HEAT;
 		bitforce->dev_over_heat_count++;
+		bitforce->hw_errors++;
 
 		if (!pdevbuf[0])	/* Only return if we got nothing after timeout - there still may be results */
 			return 0;
@@ -595,10 +591,9 @@ static int64_t bitforce_get_result(struct thr_info *thr, struct work *work)
 	else if (!strncasecmp(pdevbuf, "I", 1))
 		return 0;	/* Device idle */
 	else if (strncasecmp(pdevbuf, "NONCE-FOUND", 11)) {
-		bitforce->hw_errors++;
+		/* Unknown reply recieved */
 		applog(LOG_WARNING, "BFL%i: Error: Get result reports: %s", bitforce->device_id, pdevbuf);
-		bitforce_clear_buffer(bitforce);
-		return 0;
+		return -1;
 	}
 
 	pnoncebuf = &pdevbuf[12];
