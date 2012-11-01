@@ -209,6 +209,9 @@ enum pool_strategy pool_strategy = POOL_FAILOVER;
 int opt_rotate_period;
 static int total_urls, total_users, total_passes, total_userpasses;
 
+static void enable_pool(struct pool *pool);
+static void disable_pool(struct pool *pool);
+
 static
 #ifndef HAVE_CURSES
 const
@@ -428,7 +431,7 @@ struct pool *add_pool(void)
 	/* Make sure the pool doesn't think we've been idle since time 0 */
 	pool->tv_idle.tv_sec = ~0UL;
 
-	pool->enabled = POOL_ENABLED;
+	enable_pool(pool);
 	pool->rpc_proxy = NULL;
 
 	return pool;
@@ -667,7 +670,7 @@ static char *set_pool_disabled(bool *pool_disable)
 
 	if (total_pools) {
 		pool = pools[total_pools - 1];
-		pool->enabled = POOL_DISABLED;
+		disable_pool(pool);
     }
 	return NULL;
 }
@@ -6459,8 +6462,6 @@ int main(int argc, char *argv[])
 
 	for (i = 0; i < total_pools; i++) {
 		struct pool *pool  = pools[i];
-
-		enable_pool(pool);
 		pool->idle = true;
 	}
 
