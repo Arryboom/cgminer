@@ -54,6 +54,7 @@ enum {
 #define BITFORCE_LONG_TIMEOUT_S 30
 #define BITFORCE_LONG_TIMEOUT_MS (BITFORCE_LONG_TIMEOUT_S * 1000)
 #define BITFORCE_CHECK_INTERVAL_MS 10
+#define BITFORCE_TIMING_THRESHOLD_MS 50
 #define WORK_CHECK_INTERVAL_MS 50
 #define MAX_START_DELAY_US 100000
 #define tv_to_ms(tval) (tval.tv_sec * 1000 + tval.tv_usec / 1000)
@@ -581,11 +582,11 @@ static int64_t bitforce_get_result(struct thr_info *thr, struct work *work)
 		 * equal to the result return time.*/
 		delay_time_ms = bitforce->sleep_ms;
 
-		if (bitforce->wait_ms > bitforce->sleep_ms + (WORK_CHECK_INTERVAL_MS * 2))
+		if (bitforce->wait_ms > bitforce->sleep_ms + BITFORCE_TIMING_THRESHOLD_MS)
 			bitforce->sleep_ms += (bitforce->wait_ms - bitforce->sleep_ms) / 2;
 		else if (bitforce->wait_ms == bitforce->sleep_ms) {
-			if (bitforce->sleep_ms > WORK_CHECK_INTERVAL_MS)
-				bitforce->sleep_ms -= WORK_CHECK_INTERVAL_MS;
+			if (bitforce->sleep_ms > BITFORCE_TIMING_THRESHOLD_MS)
+				bitforce->sleep_ms -= BITFORCE_TIMING_THRESHOLD_MS;
 			else if (bitforce->sleep_ms > BITFORCE_CHECK_INTERVAL_MS)
 				bitforce->sleep_ms -= BITFORCE_CHECK_INTERVAL_MS;
 		}
