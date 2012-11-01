@@ -364,6 +364,8 @@ struct cgpu_info {
 	bool nonce_range;
 	bool polling;
 	bool flash_led;
+	struct cgminer_pool_stats device_times;
+	double throttle_temp;
 #endif
 	pthread_mutex_t		device_mutex;
 
