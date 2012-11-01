@@ -414,7 +414,7 @@ static bool bitforce_get_temp(struct cgpu_info *bitforce)
 			temp = strtod(s + 1, NULL);
 
 		if (temp > 0) {
-			bitforce->temp = temp;
+			bitforce->temp = bitforce->temp + (temp - bitforce->temp)/4;
 		}
 	} else {
 		applog(LOG_WARNING, "BFL%i: Error: Get temp returned: %s", bitforce->device_id, pdevbuf);
