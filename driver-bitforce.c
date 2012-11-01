@@ -55,7 +55,6 @@ enum {
 #define BITFORCE_LONG_TIMEOUT_MS (BITFORCE_LONG_TIMEOUT_S * 1000)
 #define BITFORCE_CHECK_INTERVAL_MS 10
 #define WORK_CHECK_INTERVAL_MS 50
-#define MAX_START_DELAY_US 100000
 #define tv_to_ms(tval) (tval.tv_sec * 1000 + tval.tv_usec / 1000)
 #define TIME_AVG_CONSTANT 8
 
@@ -693,20 +692,6 @@ static void bitforce_identify(struct cgpu_info *bitforce)
 	bitforce->flash_led = true;
 }
 
-static bool bitforce_thread_init(struct thr_info *thr)
-{
-	struct cgpu_info *bitforce = thr->cgpu;
-	unsigned int wait;
-
-	/* Pause each new thread at least 100ms between initialising
-	 * so the devices aren't making calls all at the same time. */
-	wait = thr->id * MAX_START_DELAY_US;
-	applog(LOG_DEBUG, "BFL%i: Delaying start by %dms", bitforce->device_id, wait / 1000);
-	usleep(wait);
-
-	return true;
-}
-
 static struct api_data *bitforce_api_stats(struct cgpu_info *cgpu)
 {
 	struct api_data *root = NULL;
@@ -731,7 +716,6 @@ struct device_api bitforce_api = {
 	.get_stats = bitforce_get_stats,
 	.identify_device = bitforce_identify,
 	.thread_prepare = bitforce_thread_prepare,
-	.thread_init = bitforce_thread_init,
 	.scanhash = bitforce_scanhash,
 	.thread_shutdown = bitforce_shutdown,
 	.thread_enable = biforce_thread_enable
