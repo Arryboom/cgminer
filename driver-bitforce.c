@@ -273,7 +273,7 @@ static void bitforce_clear_buffer(struct cgpu_info *bitforce)
 		return;
 
 	applog(LOG_DEBUG, "BFL%i: Clearing read buffer", bitforce->device_id);
-
+	sleep(6);
 	mutex_lock(&bitforce->device_mutex);
 	do {
 		pdevbuf[0] = '\0';
@@ -539,7 +539,7 @@ static int64_t bitforce_get_result(struct thr_info *thr, struct work *work)
 		if (elapsed.tv_sec >= BITFORCE_LONG_TIMEOUT_S) {
 			applog(LOG_ERR, "BFL%i: took %dms - longer than %dms", bitforce->device_id,
 				tv_to_ms(elapsed), BITFORCE_LONG_TIMEOUT_MS);
-			return 0;
+			return -1;
 		}
 
 		if (pdevbuf[0] && strncasecmp(pdevbuf, "B", 1)) /* BFL does not respond during throttling */
