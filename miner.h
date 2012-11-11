@@ -925,7 +925,7 @@ struct pool {
 	unsigned char *txn_hashes;
 	int gbt_txns;
 	int coinbase_len;
-	struct timeval tv_template;
+	struct timeval tv_lastwork;
 };
 
 #define GETWORK_MODE_TESTPOOL 'T'
@@ -937,7 +937,6 @@ struct pool {
 
 struct work {
 	unsigned char	data[128];
-	unsigned char	hash1[64];
 	unsigned char	midstate[32];
 	unsigned char	target[32];
 	unsigned char	hash[32];
