@@ -451,8 +451,7 @@ json_t *json_rpc_call(CURL *curl, const char *url,
 	res_val = json_object_get(val, "result");
 	err_val = json_object_get(val, "error");
 
-	if (!res_val || json_is_null(res_val) ||
-	    (err_val && !json_is_null(err_val))) {
+	if (!res_val ||(err_val && !json_is_null(err_val))) {
 		char *s;
 
 		if (err_val)
@@ -836,7 +835,6 @@ bool extract_sockaddr(struct pool *pool, char *url)
 {
 	char *url_begin, *url_end, *port_start = NULL;
 	char url_address[256], port[6];
-	struct addrinfo hints, *res;
 	int url_len, port_len = 0;
 
 	pool->sockaddr_url = url;
@@ -866,18 +864,6 @@ bool extract_sockaddr(struct pool *pool, char *url)
 		strcpy(port, "80");
 
 	pool->stratum_port = strdup(port);
-
-	memset(&hints, 0, sizeof(struct addrinfo));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-
-	if (getaddrinfo(url_address, port, &hints, &res)) {
-		applog(LOG_DEBUG, "Failed to extract sock addr");
-		return false;
-	}
-
-	pool->server = (struct sockaddr_in *)res->ai_addr;
 	pool->sockaddr_url = strdup(url_address);
 
 	return true;
@@ -1097,6 +1083,13 @@ static bool parse_notify(struct pool *pool, json_t *val)
 	}
 
 	mutex_lock(&pool->pool_lock);
+	free(pool->swork.job_id);
+	free(pool->swork.prev_hash);
+	free(pool->swork.coinbase1);
+	free(pool->swork.coinbase2);
+	free(pool->swork.bbversion);
+	free(pool->swork.nbit);
+	free(pool->swork.ntime);
 	pool->swork.job_id = job_id;
 	pool->swork.prev_hash = prev_hash;
 	pool->swork.coinbase1 = coinbase1;

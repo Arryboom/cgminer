@@ -82,7 +82,7 @@ struct strategies strategies[] = {
 	{ "Balance" },
 };
 
-static char packagename[255];
+static char packagename[256];
 
 bool opt_protocol;
 static bool opt_benchmark;
@@ -218,7 +218,7 @@ static char current_block[40];
 static char *current_hash;
 char *current_fullhash;
 static char datestamp[40];
-static char blocktime[30];
+static char blocktime[32];
 struct timeval block_timeval;
 static char best_share[8] = "0";
 static uint64_t best_diff = 0;
@@ -405,6 +405,10 @@ static void sharelog(const char*disposition, const struct work*work)
 		applog(LOG_ERR, "sharelog fwrite error");
 }
 
+static char *getwork_req = "{\"method\": \"getwork\", \"params\": [], \"id\":0}\n";
+
+static char *gbt_req = "{\"id\": 0, \"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"]}]}\n";
+
 /* Return value is ignored if not called from add_pool_details */
 struct pool *add_pool(void)
 {
@@ -416,17 +420,17 @@ struct pool *add_pool(void)
 	pool->pool_no = pool->prio = total_pools;
 	pools = realloc(pools, sizeof(struct pool *) * (total_pools + 2));
 	pools[total_pools++] = pool;
-	if (unlikely(pthread_mutex_init(&pool->pool_lock, NULL)))
-		quit(1, "Failed to pthread_mutex_init in add_pool");
+	mutex_init(&pool->pool_lock);
 	if (unlikely(pthread_cond_init(&pool->cr_cond, NULL)))
 		quit(1, "Failed to pthread_cond_init in add_pool");
-	if (unlikely(pthread_mutex_init(&pool->stratum_lock, NULL)))
-		quit(1, "Failed to pthread_mutex_init in add_pool");
+	mutex_init(&pool->stratum_lock);
+	mutex_init(&pool->gbt_lock);
 	INIT_LIST_HEAD(&pool->curlring);
 
 	/* Make sure the pool doesn't think we've been idle since time 0 */
 	pool->tv_idle.tv_sec = ~0UL;
 
+	pool->rpc_req = getwork_req;
 	pool->rpc_proxy = NULL;
 
 	return pool;
@@ -559,6 +563,7 @@ bool detect_stratum(struct pool *pool, char *url)
 		return false;
 
 	if (!strncasecmp(url, "stratum+tcp://", 14)) {
+		pool->rpc_url = strdup(url);
 		pool->has_stratum = true;
 		pool->stratum_url = pool->sockaddr_url;
 		return true;
@@ -578,11 +583,8 @@ static char *set_url(char *arg)
 
 	arg = get_proxy(arg, pool);
 
-	if (detect_stratum(pool, arg)) {
-		if (!pool->rpc_url)
-			pool->rpc_url = strdup(pool->stratum_url);
+	if (detect_stratum(pool, arg))
 		return NULL;
-	}
 
 	opt_set_charp(arg, &pool->rpc_url);
 	if (strncmp(arg, "http://", 7) &&
@@ -1353,37 +1355,280 @@ static void calc_midstate(struct work *work)
 #endif
 }
 
-static bool work_decode(const json_t *val, struct work *work)
+/* Generate a GBT coinbase from the existing GBT variables stored. Must be
+ * entered under gbt_lock */
+static void __build_gbt_coinbase(struct pool *pool)
 {
-	if (unlikely(!jobj_binary(val, "data", work->data, sizeof(work->data), true))) {
-		applog(LOG_ERR, "JSON inval data");
-		goto err_out;
+	int cbt_len, cal_len, orig_len;
+	unsigned char *coinbase;
+	uint8_t *extra_len;
+
+	cbt_len = strlen(pool->coinbasetxn) / 2;
+	pool->coinbase_len = cbt_len + 4;
+	/* We add 4 bytes of extra data corresponding to nonce2 of stratum */
+	cal_len = pool->coinbase_len + 1;
+	if (cal_len % 4)
+		cal_len += 4 - (cal_len % 4);
+	coinbase = calloc(cal_len, 1);
+	hex2bin(coinbase, pool->coinbasetxn, 42);
+	extra_len = (uint8_t *)(coinbase + 41);
+	orig_len = *extra_len;
+	hex2bin(coinbase + 42, pool->coinbasetxn + 84, orig_len);
+	memcpy(coinbase + 42 + orig_len, &pool->nonce2, 4);
+	*extra_len += 4;
+	hex2bin(coinbase + 42 + *extra_len, pool->coinbasetxn + 84 + (orig_len * 2), cbt_len - orig_len - 42);
+	pool->nonce2++;
+	free(pool->gbt_coinbase);
+	pool->gbt_coinbase = coinbase;
+}
+
+static void gen_hash(unsigned char *data, unsigned char *hash, int len);
+
+/* Process transactions with GBT by storing the binary value of the first
+ * transaction, and the hashes of the remaining transactions since these
+ * remain constant with an altered coinbase when generating work. Must be
+ * entered under gbt_lock */
+static bool __build_gbt_txns(struct pool *pool, json_t *res_val)
+{
+	json_t *txn_array;
+	bool ret = false;
+	int i, cal_len;
+
+	free(pool->txn_hashes);
+	pool->txn_hashes = NULL;
+	pool->gbt_txns = 0;
+
+	txn_array = json_object_get(res_val, "transactions");
+	if (!json_is_array(txn_array))
+		goto out;
+
+	ret = true;
+	pool->gbt_txns = json_array_size(txn_array);
+	if (!pool->gbt_txns)
+		goto out;
+
+	pool->txn_hashes = calloc(32 * (pool->gbt_txns + 1), 1);
+	if (unlikely(!pool->txn_hashes))
+		quit(1, "Failed to calloc txn_hashes in __build_gbt_txns");
+
+	for (i = 0; i < pool->gbt_txns; i++) {
+		json_t *txn_val = json_object_get(json_array_get(txn_array, i), "data");
+		const char *txn = json_string_value(txn_val);
+		int txn_len = strlen(txn);
+		unsigned char *txn_bin;
+
+		cal_len = txn_len;
+		if (cal_len % 4)
+			cal_len += 4 - (cal_len % 4);
+		txn_bin = calloc(cal_len, 1);
+		if (unlikely(!txn_bin))
+			quit(1, "Failed to calloc txn_bin in __build_gbt_txns");
+		if (unlikely(!hex2bin(txn_bin, txn, txn_len / 2)))
+			quit(1, "Failed to hex2bin txn_bin");
+
+		gen_hash(txn_bin, pool->txn_hashes + (32 * i), txn_len / 2);
+		free(txn_bin);
+	}
+out:
+	return ret;
+}
+
+static unsigned char *__gbt_merkleroot(struct pool *pool)
+{
+	unsigned char *merkle_hash;
+	int i, txns;
+
+	merkle_hash = calloc(32 * (pool->gbt_txns + 2), 1);
+	if (unlikely(!merkle_hash))
+		quit(1, "Failed to calloc merkle_hash in __gbt_merkleroot");
+
+	gen_hash(pool->gbt_coinbase, merkle_hash, pool->coinbase_len);
+
+	if (pool->gbt_txns)
+		memcpy(merkle_hash + 32, pool->txn_hashes, pool->gbt_txns * 32);
+
+	txns = pool->gbt_txns + 1;
+	while (txns > 1) {
+		if (txns % 2) {
+			memcpy(&merkle_hash[txns * 32], &merkle_hash[(txns - 1) * 32], 32);
+			txns++;
+		}
+		for (i = 0; i < txns; i += 2){
+			unsigned char hashout[32];
+
+			gen_hash(merkle_hash + (i * 32), hashout, 64);
+			memcpy(merkle_hash + (i / 2 * 32), hashout, 32);
+		}
+		txns /= 2;
+	}
+	return merkle_hash;
+}
+
+static void calc_diff(struct work *work, int known);
+
+static void gen_gbt_work(struct pool *pool, struct work *work)
+{
+	unsigned char *merkleroot;
+	char *cbhex;
+
+	mutex_lock(&pool->gbt_lock);
+	__build_gbt_coinbase(pool);
+	merkleroot = __gbt_merkleroot(pool);
+
+	memcpy(work->data, &pool->gbt_version, 4);
+	memcpy(work->data + 4, pool->previousblockhash, 32);
+	memcpy(work->data + 4 + 32 + 32, &pool->curtime, 4);
+	memcpy(work->data + 4 + 32 + 32 + 4, &pool->gbt_bits, 4);
+
+	memcpy(work->target, pool->gbt_target, 32);
+
+	cbhex = bin2hex(pool->gbt_coinbase, pool->coinbase_len);
+	sprintf(work->gbt_coinbase, "%s", cbhex);
+	free(cbhex);
+
+	/* For encoding the block data on submission */
+	work->gbt_txns = pool->gbt_txns + 1;
+	mutex_unlock(&pool->gbt_lock);
+
+	memcpy(work->data + 4 + 32, merkleroot, 32);
+	flip32(work->data + 4 + 32, merkleroot);
+	free(merkleroot);
+	memset(work->data + 4 + 32 + 32 + 4 + 4, 0, 4); /* nonce */
+
+	hex2bin(work->data + 4 + 32 + 32 + 4 + 4 + 4, "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000", 48);
+
+	if (opt_debug) {
+		char *header = bin2hex(work->data, 128);
+
+		applog(LOG_DEBUG, "Generated GBT header %s", header);
+		applog(LOG_DEBUG, "Work coinbase %s", work->gbt_coinbase);
+		free(header);
 	}
 
-	if (!jobj_binary(val, "midstate", work->midstate, sizeof(work->midstate), false)) {
+	calc_midstate(work);
+	local_work++;
+	work->pool = pool;
+	work->gbt = true;
+	work->id = total_work++;
+	work->longpoll = false;
+	work->getwork_mode = GETWORK_MODE_GBT;
+	work->work_block = work_block;
+	calc_diff(work, 0);
+	gettimeofday(&work->tv_staged, NULL);
+}
+
+static bool gbt_decode(struct pool *pool, json_t *res_val)
+{
+	const char *previousblockhash;
+	const char *target;
+	const char *coinbasetxn;
+	const char *longpollid;
+	unsigned char hash_swap[32];
+	int expires;
+	int version;
+	int curtime;
+	bool submitold;
+	const char *bits;
+
+	previousblockhash = json_string_value(json_object_get(res_val, "previousblockhash"));
+	target = json_string_value(json_object_get(res_val, "target"));
+	coinbasetxn = json_string_value(json_object_get(json_object_get(res_val, "coinbasetxn"), "data"));
+	longpollid = json_string_value(json_object_get(res_val, "longpollid"));
+	expires = json_integer_value(json_object_get(res_val, "expires"));
+	version = json_integer_value(json_object_get(res_val, "version"));
+	curtime = json_integer_value(json_object_get(res_val, "curtime"));
+	submitold = json_is_true(json_object_get(res_val, "submitold"));
+	bits = json_string_value(json_object_get(res_val, "bits"));
+
+	if (!previousblockhash || !target || !coinbasetxn || !longpollid ||
+	    !expires || !version || !curtime || !bits) {
+		applog(LOG_ERR, "JSON failed to decode GBT");
+		return false;
+	}
+
+	applog(LOG_DEBUG, "previousblockhash: %s", previousblockhash);
+	applog(LOG_DEBUG, "target: %s", target);
+	applog(LOG_DEBUG, "coinbasetxn: %s", coinbasetxn);
+	applog(LOG_DEBUG, "longpollid: %s", longpollid);
+	applog(LOG_DEBUG, "expires: %d", expires);
+	applog(LOG_DEBUG, "version: %d", version);
+	applog(LOG_DEBUG, "curtime: %d", curtime);
+	applog(LOG_DEBUG, "submitold: %s", submitold ? "true" : "false");
+	applog(LOG_DEBUG, "bits: %s", bits);
+
+	mutex_lock(&pool->gbt_lock);
+	free(pool->coinbasetxn);
+	pool->coinbasetxn = strdup(coinbasetxn);
+	free(pool->longpollid);
+	pool->longpollid = strdup(longpollid);
+
+	hex2bin(hash_swap, previousblockhash, 32);
+	swap256(pool->previousblockhash, hash_swap);
+
+	hex2bin(hash_swap, target, 32);
+	swab256(pool->gbt_target, hash_swap);
+
+	pool->gbt_expires = expires;
+	pool->gbt_version = htobe32(version);
+	pool->curtime = htobe32(curtime);
+	pool->submit_old = submitold;
+
+	hex2bin((unsigned char *)&pool->gbt_bits, bits, 4);
+
+	__build_gbt_txns(pool, res_val);
+	mutex_unlock(&pool->gbt_lock);
+
+	return true;
+}
+
+static bool getwork_decode(json_t *res_val, struct work *work)
+{
+	if (unlikely(!jobj_binary(res_val, "data", work->data, sizeof(work->data), true))) {
+		applog(LOG_ERR, "JSON inval data");
+		return false;
+	}
+
+	if (!jobj_binary(res_val, "midstate", work->midstate, sizeof(work->midstate), false)) {
 		// Calculate it ourselves
 		applog(LOG_DEBUG, "Calculating midstate locally");
 		calc_midstate(work);
 	}
 
-	if (!jobj_binary(val, "hash1", work->hash1, sizeof(work->hash1), false)) {
-		// Always the same anyway
-		memcpy(work->hash1, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x80\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\1\0\0", 64);
+	if (unlikely(!jobj_binary(res_val, "target", work->target, sizeof(work->target), true))) {
+		applog(LOG_ERR, "JSON inval target");
+		return false;
+	}
+	return true;
+}
+
+static bool work_decode(struct pool *pool, struct work *work, json_t *val)
+{
+	json_t *res_val = json_object_get(val, "result");
+	bool ret = false;
+
+	gettimeofday(&pool->tv_lastwork, NULL);
+	if (!res_val || json_is_null(res_val)) {
+		applog(LOG_ERR, "JSON Failed to decode result");
+		goto out;
 	}
 
-	if (unlikely(!jobj_binary(val, "target", work->target, sizeof(work->target), true))) {
-		applog(LOG_ERR, "JSON inval target");
-		goto err_out;
-	}
+	if (pool->has_gbt) {
+		if (unlikely(!gbt_decode(pool, res_val)))
+			goto out;
+		work->gbt = true;
+		ret = true;
+		goto out;
+	} else if (unlikely(!getwork_decode(res_val, work)))
+		goto out;
 
 	memset(work->hash, 0, sizeof(work->hash));
 
 	gettimeofday(&work->tv_staged, NULL);
 
-	return true;
+	ret = true;
 
-err_out:
-	return false;
+out:
+	return ret;
 }
 
 int dev_from_id(int thr_id)
@@ -1556,7 +1801,7 @@ static void get_statline(char *buf, struct cgpu_info *cgpu)
 static void text_print_status(int thr_id)
 {
 	struct cgpu_info *cgpu = thr_info[thr_id].cgpu;
-	char logline[255];
+	char logline[256];
 
 	if (cgpu) {
 		get_statline(logline, cgpu);
@@ -1593,8 +1838,9 @@ static void curses_print_status(void)
 		mvwprintw(statuswin, 4, 0, " Connected to multiple pools with%s LP",
 			have_longpoll ? "": "out");
 	} else {
-		mvwprintw(statuswin, 4, 0, " Connected to %s with%s LP as user %s",
-			pool->sockaddr_url, have_longpoll ? "": "out", pool->rpc_user);
+		mvwprintw(statuswin, 4, 0, " Connected to %s with%s %s as user %s",
+			pool->sockaddr_url, have_longpoll ? "": "out",
+			pool->has_gbt ? "GBT" : "LP", pool->rpc_user);
 	}
 	wclrtoeol(statuswin);
 	mvwprintw(statuswin, 5, 0, " Block: %s...  Started: %s  Best share: %s   ", current_hash, blocktime, best_share);
@@ -1616,7 +1862,7 @@ static void curses_print_devstatus(int thr_id)
 {
 	static int awidth = 1, rwidth = 1, hwwidth = 1, uwidth = 1;
 	struct cgpu_info *cgpu = thr_info[thr_id].cgpu;
-	char logline[255];
+	char logline[256];
 	char displayed_hashes[16], displayed_rolling[16];
 	uint64_t dh64, dr64;
 
@@ -1879,7 +2125,7 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 	struct pool *pool = work->pool;
 	struct cgpu_info *cgpu = thr_info[work->thr_id].cgpu;
 
-	if (json_is_true(res)) {
+	if (json_is_true(res) || (work->gbt && json_is_null(res))) {
 		cgpu->accepted++;
 		total_accepted++;
 		pool->accepted++;
@@ -1927,7 +2173,7 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 		pool->seq_rejects++;
 		applog(LOG_DEBUG, "PROOF OF WORK RESULT: false (booooo)");
 		if (!QUIET) {
-			char where[17];
+			char where[20];
 			char disposition[36] = "reject";
 			char reason[32];
 
@@ -1937,7 +2183,8 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 			else
 				strcpy(where, "");
 
-			res = json_object_get(val, "reject-reason");
+			if (!work->gbt)
+				res = json_object_get(val, "reject-reason");
 			if (res) {
 				const char *reasontmp = json_string_value(res);
 
@@ -1990,7 +2237,7 @@ static const uint64_t diffone = 0xFFFF000000000000ull;
 static uint64_t share_diff(const struct work *work)
 {
 	uint64_t *data64, d64;
-	char rhash[36];
+	char rhash[32];
 	uint64_t ret;
 
 	swab256(rhash, work->hash);
@@ -2025,7 +2272,7 @@ static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 {
 	char *hexstr = NULL;
 	json_t *val, *res, *err;
-	char s[345], sd[345];
+	char s[1024];
 	bool rc = false;
 	int thr_id = work->thr_id;
 	struct cgpu_info *cgpu = thr_info[thr_id].cgpu;
@@ -2033,7 +2280,7 @@ static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 	int rolltime;
 	uint32_t *hash32;
 	struct timeval tv_submit, tv_submit_reply;
-	char hashshow[64 + 1] = "";
+	char hashshow[64 + 4] = "";
 	char worktime[200] = "";
 
 #ifdef __BIG_ENDIAN__
@@ -2046,14 +2293,39 @@ static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 	hexstr = bin2hex(work->data, sizeof(work->data));
 
 	/* build JSON-RPC request */
-	sprintf(s,
-	      "{\"method\": \"getwork\", \"params\": [ \"%s\" ], \"id\":1}\r\n",
-		hexstr);
-	sprintf(sd,
-	      "{\"method\": \"getwork\", \"params\": [ \"%s\" ], \"id\":1}",
-		hexstr);
+	if (work->gbt) {
+		char gbt_block[1024], *varint, *header;
+		unsigned char data[80];
 
-	applog(LOG_DEBUG, "DBG: sending %s submit RPC call: %s", pool->rpc_url, sd);
+		flip80(data, work->data);
+		header = bin2hex(data, 80);
+		sprintf(gbt_block, "%s", header);
+		free(header);
+
+		if (work->gbt_txns < 0xfd) {
+			uint8_t val = work->gbt_txns;
+
+			varint = bin2hex((const unsigned char *)&val, 1);
+		} else if (work->gbt_txns <= 0xffff) {
+			uint16_t val = htole16(work->gbt_txns);
+
+			strcat(gbt_block, "fd");
+			varint = bin2hex((const unsigned char *)&val, 2);
+		} else {
+			uint32_t val = htole32(work->gbt_txns);
+
+			strcat(gbt_block, "fe");
+			varint = bin2hex((const unsigned char *)&val, 4);
+		}
+		strcat(gbt_block, varint);
+		free(varint);
+		strcat(gbt_block, work->gbt_coinbase);
+
+		sprintf(s, "{\"id\": 0, \"method\": \"submitblock\", \"params\": [\"%s\", {}]}", gbt_block);
+	} else
+		sprintf(s, "{\"method\": \"getwork\", \"params\": [ \"%s\" ], \"id\":1}", hexstr);
+	applog(LOG_DEBUG, "DBG: sending %s submit RPC call: %s", pool->rpc_url, s);
+	strcat(s, "\n");
 
 	gettimeofday(&tv_submit, NULL);
 	/* issue JSON-RPC request */
@@ -2066,6 +2338,7 @@ static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 			pool->remotefail_occasions++;
 			applog(LOG_WARNING, "Pool %d communication failure, caching submissions", pool->pool_no);
 		}
+		sleep(5);
 		goto out;
 	} else if (pool_tclear(pool, &pool->submit_fail))
 		applog(LOG_WARNING, "Pool %d communication resumed, submitting work", pool->pool_no);
@@ -2144,7 +2417,7 @@ static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 	if (!opt_realquiet)
 		print_status(thr_id);
 	if (!want_per_device_stats) {
-		char logline[255];
+		char logline[256];
 
 		get_statline(logline, cgpu);
 		applog(LOG_INFO, "%s", logline);
@@ -2157,9 +2430,6 @@ out:
 	free(hexstr);
 	return rc;
 }
-
-static const char *rpc_req =
-	"{\"method\": \"getwork\", \"params\": [], \"id\":0}\r\n";
 
 /* In balanced mode, the amount of diff1 solutions per pool is monitored as a
  * rolling average per 10 minutes and if pools start getting more, it biases
@@ -2225,7 +2495,7 @@ static void calc_diff(struct work *work, int known)
 
 	if (opt_scrypt) {
 		uint64_t *data64, d64;
-		char rtarget[36];
+		char rtarget[32];
 
 		swab256(rtarget, work->target);
 		data64 = (uint64_t *)(rtarget + 2);
@@ -2290,18 +2560,18 @@ static bool get_upstream_work(struct work *work, CURL *curl)
 	bool rc = false;
 	char *url;
 
-	applog(LOG_DEBUG, "DBG: sending %s get RPC call: %s", pool->rpc_url, rpc_req);
+	applog(LOG_DEBUG, "DBG: sending %s get RPC call: %s", pool->rpc_url, pool->rpc_req);
 
 	url = pool->rpc_url;
 
 	gettimeofday(&(work->tv_getwork), NULL);
 
-	val = json_rpc_call(curl, url, pool->rpc_userpass, rpc_req, false,
+	val = json_rpc_call(curl, url, pool->rpc_userpass, pool->rpc_req, false,
 			    false, &work->rolltime, pool, false);
 	pool_stats->getwork_attempts++;
 
 	if (likely(val)) {
-		rc = work_decode(json_object_get(val, "result"), work);
+		rc = work_decode(pool, work, val);
 		if (unlikely(!rc))
 			applog(LOG_DEBUG, "Failed to decode work in get_upstream_work");
 	} else
@@ -2761,6 +3031,29 @@ retry:
 		goto out;
 	}
 
+	if (pool->has_gbt) {
+		while (pool->idle) {
+			struct pool *altpool = select_pool(true);
+
+			sleep(5);
+			if (altpool != pool) {
+				wc->pool = altpool;
+				inc_queued(altpool);
+				dec_queued(pool);
+				goto retry;
+			}
+		}
+		ret_work = make_work();
+		gen_gbt_work(pool, ret_work);
+		if (unlikely(!stage_work(ret_work))) {
+			applog(LOG_ERR, "Failed to stage gbt work in get_work_thread");
+			kill_work();
+			free(ret_work);
+		}
+		dec_queued(pool);
+		goto out;
+	}
+
 	if (clone_available()) {
 		dec_queued(pool);
 		goto out;
@@ -2915,36 +3208,40 @@ static void *submit_work_thread(void *userdata)
 	}
 
 	if (work->stratum) {
+		struct stratum_share *sshare = calloc(sizeof(struct stratum_share), 1);
 		uint32_t *hash32 = (uint32_t *)work->hash, nonce;
 		char *noncehex;
 		char s[1024];
 
+		memcpy(&sshare->work, work, sizeof(struct work));
+		mutex_lock(&sshare_lock);
 		/* Give the stratum share a unique id */
-		swork_id++;
+		sshare->id = swork_id++;
+		HASH_ADD_INT(stratum_shares, id, sshare);
+		mutex_unlock(&sshare_lock);
+
 		nonce = *((uint32_t *)(work->data + 76));
 		noncehex = bin2hex((const unsigned char *)&nonce, 4);
-
 		memset(s, 0, 1024);
 		sprintf(s, "{\"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\": %d, \"method\": \"mining.submit\"}",
-			pool->rpc_user, work->job_id, work->nonce2, work->ntime, noncehex, swork_id);
+			pool->rpc_user, work->job_id, work->nonce2, work->ntime, noncehex, sshare->id);
 		free(noncehex);
 
 		applog(LOG_INFO, "Submitting share %08lx to pool %d", (unsigned long)(hash32[6]), pool->pool_no);
 
 		if (likely(stratum_send(pool, s, strlen(s)))) {
-			struct stratum_share *sshare = calloc(sizeof(struct stratum_share), 1);
-
 			if (pool_tclear(pool, &pool->submit_fail))
 					applog(LOG_WARNING, "Pool %d communication resumed, submitting work", pool->pool_no);
 			applog(LOG_DEBUG, "Successfully submitted, adding to stratum_shares db");
-			memcpy(&sshare->work, work, sizeof(struct work));
-
-			mutex_lock(&sshare_lock);
-			sshare->id = swork_id;
-			HASH_ADD_INT(stratum_shares, id, sshare);
-			mutex_unlock(&sshare_lock);
 		} else {
-			applog(LOG_INFO, "Failed to submit stratum share");
+			applog(LOG_WARNING, "Failed to submit stratum share to pool %d", pool->pool_no);
+			mutex_lock(&sshare_lock);
+			HASH_DEL(stratum_shares, sshare);
+			mutex_unlock(&sshare_lock);
+			free(sshare);
+			pool->stale_shares++;
+			total_stale++;
+
 			if (!pool_tset(pool, &pool->submit_fail)) {
 				total_ro++;
 				pool->remotefail_occasions++;
@@ -3234,7 +3531,10 @@ static bool test_work_current(struct work *work)
 	if (work->mandatory)
 		return ret;
 
+	/* Hack to work around dud work sneaking into test */
 	hexstr = bin2hex(work->data + 8, 18);
+	if (!strncmp(hexstr, "000000000000000000000000000000000000", 36))
+		goto out_free;
 
 	/* Search to see if this block exists yet and if not, consider it a
 	 * new block and set the current block details to this one */
@@ -3272,9 +3572,8 @@ static bool test_work_current(struct work *work)
 
 		if (!work->stratum) {
 			if (work->longpoll) {
-				applog(LOG_NOTICE, "LONGPOLL from pool %d detected new block",
-				       work->pool->pool_no);
-				work->longpoll = false;
+				applog(LOG_NOTICE, "%sLONGPOLL from pool %d detected new block",
+				       work->gbt ? "GBT " : "", work->pool->pool_no);
 			} else if (have_longpoll)
 				applog(LOG_NOTICE, "New block detected on network before longpoll");
 			else
@@ -3282,14 +3581,14 @@ static bool test_work_current(struct work *work)
 		}
 		restart_threads();
 	} else if (work->longpoll) {
-		work->longpoll = false;
 		if (work->pool == current_pool()) {
-			applog(LOG_NOTICE, "LONGPOLL from pool %d requested work restart",
-				work->pool->pool_no);
+			applog(LOG_NOTICE, "%sLONGPOLL from pool %d requested work restart",
+			       work->gbt ? "GBT " : "", work->pool->pool_no);
 			work_block++;
 			restart_threads();
 		}
 	}
+	work->longpoll = false;
 out_free:
 	free(hexstr);
 	return ret;
@@ -4244,7 +4543,7 @@ static void stratum_share_result(json_t *val, json_t *res_val, json_t *err_val,
 
 /* Parses stratum json responses and tries to find the id that the request
  * matched to and treat it accordingly. */
-static bool parse_stratum_response(char *s)
+static bool parse_stratum_response(struct pool *pool, char *s)
 {
 	json_t *val = NULL, *err_val, *res_val, *id_val;
 	struct stratum_share *sshare;
@@ -4285,9 +4584,9 @@ static bool parse_stratum_response(char *s)
 	mutex_unlock(&sshare_lock);
 	if (!sshare) {
 		if (json_is_true(res_val))
-			applog(LOG_NOTICE, "Accepted untracked stratum share");
+			applog(LOG_NOTICE, "Accepted untracked stratum share from pool %d", pool->pool_no);
 		else
-			applog(LOG_NOTICE, "Rejected untracked stratum share");
+			applog(LOG_NOTICE, "Rejected untracked stratum share from pool %d", pool->pool_no);
 		goto out;
 	}
 	stratum_share_result(val, res_val, err_val, sshare);
@@ -4302,6 +4601,28 @@ out:
 }
 
 static void pool_resus(struct pool *pool);
+
+static void clear_stratum_shares(struct pool *pool)
+{
+	struct stratum_share *sshare, *tmpshare;
+	int cleared = 0;
+
+	mutex_lock(&sshare_lock);
+	HASH_ITER(hh, stratum_shares, sshare, tmpshare) {
+		if (sshare->work.pool == pool) {
+			HASH_DEL(stratum_shares, sshare);
+			free(sshare);
+			cleared++;
+		}
+	}
+	mutex_unlock(&sshare_lock);
+
+	if (cleared) {
+		applog(LOG_WARNING, "Lost %d shares due to stratum disconnect on pool %d", cleared, pool->pool_no);
+		pool->stale_shares++;
+		total_stale++;
+	}
+}
 
 /* One stratum thread per pool that has stratum waits on the socket checking
  * for new messages and for the integrity of the socket connection. We reset
@@ -4330,12 +4651,19 @@ static void *stratum_thread(void *userdata)
 		 * every minute so if we fail to receive any for 90 seconds we
 		 * assume the connection has been dropped and treat this pool
 		 * as dead */
-		select(pool->sock + 1, &rd, NULL, NULL, &timeout);
-		s = recv_line(pool);
+		if (unlikely(select(pool->sock + 1, &rd, NULL, NULL, &timeout) < 1))
+			s = NULL;
+		else
+			s = recv_line(pool);
 		if (!s) {
 			applog(LOG_INFO, "Stratum connection to pool %d interrupted", pool->pool_no);
 			pool->getfail_occasions++;
 			total_go++;
+
+			/* If the socket to our stratum pool disconnects, all
+			 * tracked submitted shares are lost and we will leak
+			 * the memory if we don't discard their records. */
+			clear_stratum_shares(pool);
 
 			if (initiate_stratum(pool) && auth_stratum(pool))
 				continue;
@@ -4352,11 +4680,12 @@ static void *stratum_thread(void *userdata)
 			continue;
 		}
 
-		if (!parse_method(pool, s) && !parse_stratum_response(s))
+		if (!parse_method(pool, s) && !parse_stratum_response(pool, s))
 			applog(LOG_INFO, "Unknown stratum msg: %s", s);
 		free(s);
 		if (pool->swork.clean) {
 			struct work work;
+			memset(&work, 0, sizeof(work));
 
 			/* Generate a single work item to update the current
 			 * block database */
@@ -4407,7 +4736,10 @@ static bool pool_active(struct pool *pool, bool pinging)
 	CURL *curl;
 	int rolltime;
 
-	applog(LOG_INFO, "Testing pool %s", pool->rpc_url);
+	if (pool->has_gbt)
+		applog(LOG_DEBUG, "Retrieving block template from pool %s", pool->rpc_url);
+	else
+		applog(LOG_INFO, "Testing pool %s", pool->rpc_url);
 
 	/* This is the central point we activate stratum when we can */
 retry_stratum:
@@ -4434,9 +4766,56 @@ retry_stratum:
 		return false;
 	}
 
+	/* Probe for GBT support on first pass */
+	if (!pool->probed && !opt_fix_protocol) {
+		applog(LOG_DEBUG, "Probing for GBT support");
+		val = json_rpc_call(curl, pool->rpc_url, pool->rpc_userpass,
+				    gbt_req, true, false, &rolltime, pool, false);
+		if (val) {
+			bool append = false, submit = false;
+			json_t *res_val, *mutables;
+			int i, mutsize = 0;
+
+			res_val = json_object_get(val, "result");
+			if (res_val) {
+				mutables = json_object_get(res_val, "mutable");
+				mutsize = json_array_size(mutables);
+			}
+
+			for (i = 0; i < mutsize; i++) {
+				json_t *arrval = json_array_get(mutables, i);
+
+				if (json_is_string(arrval)) {
+					const char *mutable = json_string_value(arrval);
+
+					if (!strncasecmp(mutable, "coinbase/append", 15))
+						append = true;
+					else if (!strncasecmp(mutable, "submit/coinbase", 15))
+						submit = true;
+				}
+			}
+			json_decref(val);
+
+			/* Only use GBT if it supports coinbase append and
+			 * submit coinbase */
+			if (append && submit) {
+				pool->has_gbt = true;
+				pool->rpc_req = gbt_req;
+			}
+		}
+		/* Reset this so we can probe fully just after this. It will be
+		 * set to true that time.*/
+		pool->probed = false;
+
+		if (pool->has_gbt)
+			applog(LOG_DEBUG, "GBT coinbase + append support found, switching to GBT protocol");
+		else
+			applog(LOG_DEBUG, "No GBT coinbase + append support found, using getwork protocol");
+	}
+
 	gettimeofday(&tv_getwork, NULL);
-	val = json_rpc_call(curl, pool->rpc_url, pool->rpc_userpass, rpc_req,
-			true, false, &rolltime, pool, false);
+	val = json_rpc_call(curl, pool->rpc_url, pool->rpc_userpass,
+			    pool->rpc_req, true, false, &rolltime, pool, false);
 	gettimeofday(&tv_getwork_reply, NULL);
 
 	/* Detect if a http getwork pool has an X-Stratum header at startup,
@@ -4455,7 +4834,7 @@ retry_stratum:
 		struct work *work = make_work();
 		bool rc;
 
-		rc = work_decode(json_object_get(val, "result"), work);
+		rc = work_decode(pool, work, val);
 		if (rc) {
 			applog(LOG_DEBUG, "Successfully retrieved and deciphered work from pool %u %s",
 			       pool->pool_no, pool->rpc_url);
@@ -4630,7 +5009,15 @@ static bool reuse_work(struct work *work, struct pool *pool)
 		if (!pool->stratum_active)
 			return false;
 		applog(LOG_DEBUG, "Reusing stratum work");
-		gen_stratum_work(pool, work);;
+		gen_stratum_work(pool, work);
+		return true;
+	}
+
+	if (pool->has_gbt) {
+		if (pool->idle)
+			return false;
+		applog(LOG_DEBUG, "Reusing GBT work");
+		gen_gbt_work(pool, work);
 		return true;
 	}
 
@@ -4681,7 +5068,7 @@ static struct work *clone_work(struct work *work)
 
 static void gen_hash(unsigned char *data, unsigned char *hash, int len)
 {
-	unsigned char hash1[36];
+	unsigned char hash1[32];
 
 	sha2(data, len, hash1, false);
 	sha2(hash1, 32, hash, false);
@@ -4693,7 +5080,7 @@ static void gen_hash(unsigned char *data, unsigned char *hash, int len)
  * cover a huge range of difficulty targets, though not all 256 bits' worth */
 static void set_work_target(struct work *work, int diff)
 {
-	unsigned char rtarget[36], target[36];
+	unsigned char rtarget[32], target[32];
 	uint64_t *data64, h64;
 
 	h64 = diffone;
@@ -4716,9 +5103,9 @@ static void set_work_target(struct work *work, int diff)
  * other means to detect when the pool has died in stratum_thread */
 static void gen_stratum_work(struct pool *pool, struct work *work)
 {
-	unsigned char *coinbase, merkle_root[36], merkle_sha[68], *merkle_hash;
-	char header[260], hash1[132], *nonce2;
+	unsigned char *coinbase, merkle_root[32], merkle_sha[64], *merkle_hash;
 	int len, cb1_len, n1_len, cb2_len, i;
+	char header[260], *nonce2;
 	uint32_t *data32, *swap32;
 
 	memset(work->job_id, 0, 64);
@@ -4744,7 +5131,7 @@ static void gen_stratum_work(struct pool *pool, struct work *work)
 	gen_hash(coinbase, merkle_root, len);
 	memcpy(merkle_sha, merkle_root, 32);
 	for (i = 0; i < pool->swork.merkles; i++) {
-		unsigned char merkle_bin[36];
+		unsigned char merkle_bin[32];
 
 		hex2bin(merkle_bin, pool->swork.merkle[i], 32);
 		memcpy(merkle_sha + 32, merkle_bin, 32);
@@ -4787,9 +5174,6 @@ static void gen_stratum_work(struct pool *pool, struct work *work)
 	if (unlikely(!hex2bin(work->data, header, 128)))
 		quit(1, "Failed to convert header to data in gen_stratum_work");
 	calc_midstate(work);
-	sprintf(hash1, "00000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000010000");
-	if (unlikely(!hex2bin(work->hash1, hash1, 64)))
-		quit(1,  "Failed to convert hash1 in gen_stratum_work");
 
 	set_work_target(work, work->sdiff);
 
@@ -4822,6 +5206,8 @@ static void get_work(struct work *work, struct thr_info *thr, const int thr_id)
 		goto out;
 	}
 
+	/* Reset these flags in case we switch pools with these work structs */
+	work->stratum = work->gbt = false;
 retry:
 	pool = current_pool();
 
@@ -4936,7 +5322,7 @@ static bool hashtest(struct thr_info *thr, struct work *work)
 	unsigned char hash2[32];
 	uint32_t *hash2_32 = (uint32_t *)hash2;
 	struct pool *pool = work->pool;
-	int i, diff;
+	int i;
 
 	for (i = 0; i < 80 / 4; i++)
 		swap32[i] = swab32(data32[i]);
@@ -4962,19 +5348,30 @@ static bool hashtest(struct thr_info *thr, struct work *work)
 	}
 
 	if (work->stratum) {
+		int diff;
+
 		mutex_lock(&pool->pool_lock);
 		diff = pool->swork.diff;
 		mutex_unlock(&pool->pool_lock);
 
-		if (unlikely(work->sdiff != diff)) {
+		/* Retarget share only if pool diff has dropped since we
+		 * generated this work */
+		if (unlikely(work->sdiff > diff)) {
 			applog(LOG_DEBUG, "Share needs retargetting to match pool");
 			set_work_target(work, diff);
 		}
 	}
 
 	bool test = fulltest(work->hash, work->target);
-	if (!test)
+	if (!test) {
 		applog(LOG_INFO, "Share below target");
+		/* Check the diff of the share, even if it didn't reach the
+		 * target, just to set the best share value if it's higher. */
+		if (opt_scrypt)
+			scrypt_diff(work);
+		else
+			share_diff(work);
+	}
 
 	return test;
 }
@@ -5232,7 +5629,7 @@ static void convert_to_work(json_t *val, int rolltime, struct pool *pool, struct
 
 	work = make_work();
 
-	rc = work_decode(json_object_get(val, "result"), work);
+	rc = work_decode(pool, work, val);
 	if (unlikely(!rc)) {
 		applog(LOG_ERR, "Could not convert longpoll data to work");
 		free_work(work);
@@ -5240,14 +5637,17 @@ static void convert_to_work(json_t *val, int rolltime, struct pool *pool, struct
 	}
 	work->pool = pool;
 	work->rolltime = rolltime;
-	work->longpoll = true;
 	memcpy(&(work->tv_getwork), tv_lp, sizeof(struct timeval));
 	memcpy(&(work->tv_getwork_reply), tv_lp_reply, sizeof(struct timeval));
-	work->getwork_mode = GETWORK_MODE_LP;
 	calc_diff(work, 0);
 
 	if (pool->enabled == POOL_REJECTING)
 		work->mandatory = true;
+
+	if (pool->has_gbt)
+		gen_gbt_work(pool, work);
+	work->longpoll = true;
+	work->getwork_mode = GETWORK_MODE_LP;
 
 	/* We'll be checking this work item twice, but we already know it's
 	 * from a new block so explicitly force the new block detection now
@@ -5281,12 +5681,12 @@ static struct pool *select_longpoll_pool(struct pool *cp)
 {
 	int i;
 
-	if (cp->hdr_path)
+	if (cp->hdr_path || cp->has_gbt)
 		return cp;
 	for (i = 0; i < total_pools; i++) {
 		struct pool *pool = pools[i];
 
-		if (pool->hdr_path)
+		if (pool->has_stratum || pool->hdr_path)
 			return pool;
 	}
 	return NULL;
@@ -5316,22 +5716,30 @@ static void *longpoll_thread(void *userdata)
 	struct timeval start, reply, end;
 	CURL *curl = NULL;
 	int failures = 0;
+	char lpreq[1024];
+	char *lp_url;
 	int rolltime;
 
 	curl = curl_easy_init();
 	if (unlikely(!curl)) {
 		applog(LOG_ERR, "CURL initialisation failed");
-		goto out;
+		return NULL;
 	}
 
 retry_pool:
 	pool = select_longpoll_pool(cp);
 	if (!pool) {
-		applog(LOG_WARNING, "No suitable long-poll found for pool %s", cp->rpc_url);
+		applog(LOG_WARNING, "No suitable long-poll found for %s", cp->rpc_url);
 		while (!pool) {
 			sleep(60);
 			pool = select_longpoll_pool(cp);
 		}
+	}
+
+	if (pool->has_stratum) {
+		applog(LOG_WARNING, "Block change for %s detection via %s stratum",
+		       cp->rpc_url, pool->rpc_url);
+		goto out;
 	}
 
 	/* Any longpoll from any pool is enough for this to be true */
@@ -5339,10 +5747,18 @@ retry_pool:
 
 	wait_lpcurrent(cp);
 
-	if (cp == pool)
-		applog(LOG_WARNING, "Long-polling activated for %s", pool->lp_url);
-	else
-		applog(LOG_WARNING, "Long-polling activated for pool %s via %s", cp->rpc_url, pool->lp_url);
+	if (pool->has_gbt) {
+		lp_url = pool->rpc_url;
+		applog(LOG_WARNING, "GBT longpoll ID activated for %s", lp_url);
+	} else {
+		strcpy(lpreq, getwork_req);
+
+		lp_url = pool->lp_url;
+		if (cp == pool)
+			applog(LOG_WARNING, "Long-polling activated for %s", lp_url);
+		else
+			applog(LOG_WARNING, "Long-polling activated for %s via %s", cp->rpc_url, lp_url);
+	}
 
 	while (42) {
 		json_t *val, *soval;
@@ -5351,13 +5767,23 @@ retry_pool:
 
 		gettimeofday(&start, NULL);
 
+		/* Update the longpollid every time, but do it under lock to
+		 * avoid races */
+		if (pool->has_gbt) {
+			mutex_lock(&pool->gbt_lock);
+			sprintf(lpreq, "{\"id\": 0, \"method\": \"getblocktemplate\", \"params\": "
+				"[{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], "
+				"\"longpollid\": \"%s\"}]}\n", pool->longpollid);
+			mutex_unlock(&pool->gbt_lock);
+		}
+
 		/* Longpoll connections can be persistent for a very long time
 		 * and any number of issues could have come up in the meantime
 		 * so always establish a fresh connection instead of relying on
 		 * a persistent one. */
 		curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
-		val = json_rpc_call(curl, pool->lp_url, pool->rpc_userpass, rpc_req,
-				    false, true, &rolltime, pool, false);
+		val = json_rpc_call(curl, lp_url, pool->rpc_userpass,
+				    lpreq, false, true, &rolltime, pool, false);
 
 		gettimeofday(&reply, NULL);
 
@@ -5379,11 +5805,17 @@ retry_pool:
 			if (end.tv_sec - start.tv_sec > 30)
 				continue;
 			if (failures == 1)
-				applog(LOG_WARNING, "longpoll failed for %s, retrying every 30s", pool->lp_url);
+				applog(LOG_WARNING, "longpoll failed for %s, retrying every 30s", lp_url);
 			sleep(30);
 		}
+
 		if (pool != cp) {
 			pool = select_longpoll_pool(cp);
+			if (pool->has_stratum) {
+				applog(LOG_WARNING, "Block change for %s detection via %s stratum",
+				       cp->rpc_url, pool->rpc_url);
+				break;
+			}
 			if (unlikely(!pool))
 				goto retry_pool;
 		}
@@ -5393,8 +5825,7 @@ retry_pool:
 	}
 
 out:
-	if (curl)
-		curl_easy_cleanup(curl);
+	curl_easy_cleanup(curl);
 
 	return NULL;
 }
@@ -5432,6 +5863,58 @@ static void reap_curl(struct pool *pool)
 		applog(LOG_DEBUG, "Reaped %d curl%s from pool %d", reaped, reaped > 1 ? "s" : "", pool->pool_no);
 }
 
+static bool pool_getswork(struct pool *pool)
+{
+	struct timeval tv_getwork, tv_getwork_reply;
+	bool ret = false;
+	int rolltime;
+	json_t *val;
+	CURL *curl;
+
+	curl = curl_easy_init();
+	if (unlikely(!curl))
+		quit (1, "CURL initialisation failed in pool_getswork");
+
+	gettimeofday(&tv_getwork, NULL);
+	val = json_rpc_call(curl, pool->rpc_url, pool->rpc_userpass,
+			    pool->rpc_req, true, false, &rolltime, pool, false);
+	gettimeofday(&tv_getwork_reply, NULL);
+
+	if (val) {
+		struct work *work = make_work();
+		bool rc = work_decode(pool, work, val);
+
+		if (rc) {
+			applog(LOG_DEBUG, "Successfully retrieved and deciphered work from pool %u %s",
+			       pool->pool_no, pool->rpc_url);
+			work->pool = pool;
+			work->rolltime = rolltime;
+			memcpy(&(work->tv_getwork), &tv_getwork, sizeof(struct timeval));
+			memcpy(&(work->tv_getwork_reply), &tv_getwork_reply, sizeof(struct timeval));
+			work->getwork_mode = GETWORK_MODE_TESTPOOL;
+			calc_diff(work, 0);
+			applog(LOG_DEBUG, "Pushing pool_getswork work for pool %d", pool->pool_no);
+
+			tq_push(thr_info[stage_thr_id].q, work);
+			total_getworks++;
+			pool->getwork_requested++;
+			ret = true;
+			gettimeofday(&pool->tv_idle, NULL);
+			ret = true;
+		} else {
+			applog(LOG_DEBUG, "Successfully retrieved but FAILED to decipher work from pool %u %s",
+			       pool->pool_no, pool->rpc_url);
+			free_work(work);
+		}
+		json_decref(val);
+	} else {
+		applog(LOG_DEBUG, "FAILED to retrieve pool_getswork work from pool %u %s",
+		       pool->pool_no, pool->rpc_url);
+	}
+	curl_easy_cleanup(curl);
+	return ret;
+}
+
 static void *watchpool_thread(void __maybe_unused *userdata)
 {
 	int intervals = 0;
@@ -5455,8 +5938,18 @@ static void *watchpool_thread(void __maybe_unused *userdata)
 			if (pool->enabled == POOL_DISABLED || pool->has_stratum)
 				continue;
 
+			/* Stratum works off pushing work, but GBT and getwork
+			 * off requests so even for the non current pool, get
+			 * new work once per minute to ensure the pool is still
+			 * alive and to maintain the current block template for
+			 * GBT pools in case we switch to them. */
+			if (!pool->idle && now.tv_sec - pool->tv_lastwork.tv_sec > 60) {
+				if (!pool_getswork(pool))
+					pool_died(pool);
+			}
+
 			/* Test pool is idle once every minute */
-			if (pool->idle && now.tv_sec - pool->tv_idle.tv_sec > 60) {
+			if (pool->idle && now.tv_sec - pool->tv_idle.tv_sec > 30) {
 				gettimeofday(&pool->tv_idle, NULL);
 				if (pool_active(pool, true) && pool_tclear(pool, &pool->idle))
 					pool_resus(pool);
@@ -5862,12 +6355,11 @@ static bool input_pool(bool live)
 
 	pool = add_pool();
 
-	if (detect_stratum(pool, url))
-		url = strdup(pool->stratum_url);
-	else if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) {
+	if (!detect_stratum(pool, url) && strncmp(url, "http://", 7) &&
+	    strncmp(url, "https://", 8)) {
 		char *httpinput;
 
-		httpinput = malloc(255);
+		httpinput = malloc(256);
 		if (!httpinput)
 			quit(1, "Failed to malloc httpinput");
 		strcpy(httpinput, "http://");
@@ -6431,6 +6923,7 @@ int main(int argc, char *argv[])
 		for (i = 0; i < total_pools; i++) {
 			struct pool *pool  = pools[i];
 			if (pool_active(pool, false)) {
+				pool_tclear(pool, &pool->idle);
 				if (!currentpool)
 					currentpool = pool;
 				applog(LOG_INFO, "Pool %d %s active", pool->pool_no, pool->rpc_url);
