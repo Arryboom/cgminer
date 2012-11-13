@@ -3832,8 +3832,8 @@ void write_config(FILE *fcfg)
     			json_escape(pools[i]->rpc_url));
     		fprintf(fcfg, "\n\t\t\"user\" : \"%s\",", json_escape(pools[i]->rpc_user));
     		fprintf(fcfg, "\n\t\t\"pass\" : \"%s\"", json_escape(pools[i]->rpc_pass));
-            s = (pools[i]->enabled == POOL_DISABLED) ? ",\n\t\t\"disable-pool\" : true\n\t}%s" : "\n\t}%s";
-			fprintf(fcfg, s, (j < total_pools - 1) ? "," : "");
+            s = (pools[i]->enabled == POOL_DISABLED) ? ",\n\t\t\"disable-pool\" : true\n\t}%s" : "\n\t}";
+			fprintf(fcfg, s);
 			j++;
 			i=0;
 		} else
